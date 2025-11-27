@@ -29,7 +29,7 @@ __decorate([
     __metadata("design:type", String)
 ], Token.prototype, "coingecko_id", void 0);
 __decorate([
-    (0, typeorm_1.Column)({ type: 'varchar', length: 200, nullable: true }),
+    (0, typeorm_1.Column)({ type: 'text', nullable: true }),
     __metadata("design:type", String)
 ], Token.prototype, "name", void 0);
 __decorate([
@@ -49,7 +49,7 @@ __decorate([
     __metadata("design:type", String)
 ], Token.prototype, "about", void 0);
 __decorate([
-    (0, typeorm_1.Column)({ type: 'varchar', length: 200, nullable: true }),
+    (0, typeorm_1.Column)({ type: 'text', nullable: true }),
     __metadata("design:type", String)
 ], Token.prototype, "category", void 0);
 __decorate([

@@ -311,46 +311,61 @@ export class PricesService implements OnModuleInit, OnModuleDestroy {
       // continue to fallback
     }
 
-    // If we have cached data but no coinDetailsData, fetch it to get contract_addresses and categories
-    // Check Redis cache first for coin details (cache for 1 hour since static data doesn't change often)
+    // If we have cached data, check if we need coin details for contract_address and categories
+    // First check database - if token exists there, we already have the static data
+    // Only fetch from CoinGecko if token is NOT in database
     if (liveData && coinIdFromCache && !(liveData as any).__coinDetailsData) {
       try {
-        const client = this.ensureRedis();
-        if (client) {
-          const detailsKey = this.coinDetailsKey(coinIdFromCache);
-          const cachedDetails = await client.get(detailsKey);
-          if (cachedDetails) {
+        // Check database first - if token exists, we have contract_address and categories
+        const tokenInDb = await this.tokenRepo.findOne({
+          where: { symbol: symbol.toUpperCase() },
+          select: ['contract_address', 'categories'],
+        });
+        
+        if (tokenInDb && (tokenInDb.contract_address || tokenInDb.categories)) {
+          // We have static data in database, no need to fetch from CoinGecko
+          this.logger.debug(`Using static data from database for ${symbol}`);
+          (liveData as any).__coinDetailsData = null; // Mark as checked, no API call needed
+        } else {
+          // Token not in database or missing static fields, check Redis cache for coin details
+          const client = this.ensureRedis();
+          if (client) {
+            const detailsKey = this.coinDetailsKey(coinIdFromCache);
+            const cachedDetails = await client.get(detailsKey);
+            if (cachedDetails) {
+              try {
+                (liveData as any).__coinDetailsData = JSON.parse(cachedDetails);
+                this.logger.debug(`Found coin details in cache for ${coinIdFromCache}`);
+              } catch (e) {
+                // Cache parse failed, continue to fetch
+              }
+            }
+          }
+
+          // If not in cache and not in database, fetch from API (only if needed)
+          if (!(liveData as any).__coinDetailsData) {
             try {
-              (liveData as any).__coinDetailsData = JSON.parse(cachedDetails);
-              this.logger.debug(`Found coin details in cache for ${coinIdFromCache}`);
-            } catch (e) {
-              // Cache parse failed, continue to fetch
+              const coinDetailsData = await this.cg.coinDetails(coinIdFromCache, false); // Don't need market data, we already have it
+              (liveData as any).__coinDetailsData = coinDetailsData;
+              
+              // Cache coin details for 1 hour (static data doesn't change often)
+              try {
+                const client = this.ensureRedis();
+                if (client) {
+                  const detailsKey = this.coinDetailsKey(coinIdFromCache);
+                  await client.set(detailsKey, JSON.stringify(coinDetailsData), 'EX', 3600); // 1 hour cache
+                }
+              } catch (err) {
+                this.logger.debug('Failed to cache coin details');
+              }
+            } catch (err) {
+              this.logger.warn(`Failed to fetch coin details for cached ${coinIdFromCache}: ${(err as any).message}`);
             }
           }
         }
       } catch (err) {
-        // Continue to fetch if cache check fails
-      }
-
-      // If not in cache, fetch from API
-      if (!(liveData as any).__coinDetailsData) {
-        try {
-          const coinDetailsData = await this.cg.coinDetails(coinIdFromCache, false); // Don't need market data, we already have it
-          (liveData as any).__coinDetailsData = coinDetailsData;
-          
-          // Cache coin details for 1 hour (static data doesn't change often)
-          try {
-            const client = this.ensureRedis();
-            if (client) {
-              const detailsKey = this.coinDetailsKey(coinIdFromCache);
-              await client.set(detailsKey, JSON.stringify(coinDetailsData), 'EX', 3600); // 1 hour cache
-            }
-          } catch (err) {
-            this.logger.debug('Failed to cache coin details');
-          }
-        } catch (err) {
-          this.logger.warn(`Failed to fetch coin details for cached ${coinIdFromCache}: ${(err as any).message}`);
-        }
+        // Continue to fetch if database check fails
+        this.logger.warn(`Failed to check database for static data: ${(err as any).message}`);
       }
     }
 
@@ -408,42 +423,59 @@ export class PricesService implements OnModuleInit, OnModuleDestroy {
         }
 
         // Fetch full coin details to get contract_addresses and categories
-        // Check Redis cache first for coin details
+        // First check database - if token exists there, we already have the static data
+        // Only fetch from CoinGecko if token is NOT in database
         let coinDetailsData: any = null;
         if (coinId) {
           try {
-            // Try Redis cache first for coin details
-            const client = this.ensureRedis();
-            if (client) {
-              const detailsKey = this.coinDetailsKey(coinId);
-              const cachedDetails = await client.get(detailsKey);
-              if (cachedDetails) {
-                try {
-                  coinDetailsData = JSON.parse(cachedDetails);
-                  this.logger.debug(`Found coin details in cache for ${coinId}`);
-                } catch (e) {
-                  // Cache parse failed, continue to fetch
+            // Check database first - if token exists, we have contract_address and categories
+            const tokenInDb = await this.tokenRepo.findOne({
+              where: { symbol: symbol.toUpperCase() },
+              select: ['contract_address', 'categories'],
+            });
+            
+            if (tokenInDb && (tokenInDb.contract_address || tokenInDb.categories)) {
+              // We have static data in database, no need to fetch from CoinGecko
+              this.logger.debug(`Using static data from database for ${symbol}, skipping CoinGecko API call`);
+              coinDetailsData = null; // No API call needed
+            } else {
+              // Token not in database or missing static fields, check Redis cache for coin details
+              const client = this.ensureRedis();
+              if (client) {
+                const detailsKey = this.coinDetailsKey(coinId);
+                const cachedDetails = await client.get(detailsKey);
+                if (cachedDetails) {
+                  try {
+                    coinDetailsData = JSON.parse(cachedDetails);
+                    this.logger.debug(`Found coin details in cache for ${coinId}`);
+                  } catch (e) {
+                    // Cache parse failed, continue to fetch
+                  }
                 }
               }
-            }
 
-            // If not in cache, fetch from API
-            if (!coinDetailsData) {
-              // If we found it in markets, we already have live data, so just fetch static fields
-              // If we didn't find it, fetch full details including market data
-              coinDetailsData = await this.cg.coinDetails(coinId, !found);
-              
-              // Cache coin details for 1 hour (static data doesn't change often)
-              try {
-                const client = this.ensureRedis();
-                if (client) {
-                  const detailsKey = this.coinDetailsKey(coinId);
-                  await client.set(detailsKey, JSON.stringify(coinDetailsData), 'EX', 3600); // 1 hour cache
+              // If not in cache and not in database, fetch from API (only if needed)
+              if (!coinDetailsData) {
+                // If we found it in markets, we already have live data, so just fetch static fields
+                // If we didn't find it, fetch full details including market data
+                coinDetailsData = await this.cg.coinDetails(coinId, !found);
+                
+                // Cache coin details for 1 hour (static data doesn't change often)
+                try {
+                  const client = this.ensureRedis();
+                  if (client) {
+                    const detailsKey = this.coinDetailsKey(coinId);
+                    await client.set(detailsKey, JSON.stringify(coinDetailsData), 'EX', 3600); // 1 hour cache
+                  }
+                } catch (err) {
+                  this.logger.debug('Failed to cache coin details');
                 }
-              } catch (err) {
-                this.logger.debug('Failed to cache coin details');
               }
             }
+          } catch (err) {
+            this.logger.warn(`Failed to check database for static data: ${(err as any).message}`);
+          }
+        }
             
             // If we didn't find it in markets, use coin details for live data
             if (!found && coinDetailsData && coinDetailsData.market_data) {

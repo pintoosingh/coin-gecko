@@ -28,7 +28,7 @@ exports.AppModule = AppModule = __decorate([
                         type: 'postgres',
                         url: process.env.DATABASE_URL,
                         autoLoadEntities: true,
-                        synchronize: false,
+                        synchronize: true,
                         logging: ['error', 'warn'],
                     };
                     if (process.env.DATABASE_URL) {

@@ -13,7 +13,7 @@ export class Token {
   @Column({ type: 'varchar', length: 200, nullable: true })
   coingecko_id: string;
 
-  @Column({ type: 'varchar', length: 200, nullable: true })
+  @Column({ type: 'text', nullable: true })
   name: string;
 
   @Column({ type: 'text', nullable: true })
@@ -28,7 +28,7 @@ export class Token {
   @Column({ type: 'text', nullable: true })
   about: string;
 
-  @Column({ type: 'varchar', length: 200, nullable: true })
+  @Column({ type: 'text', nullable: true })
   category: string;
 
   @Column({ type: 'varchar', length: 255, nullable: true })

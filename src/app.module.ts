@@ -16,7 +16,7 @@ import { PriceHistory } from './entities/price-history.entity';
           type: 'postgres',
           url: process.env.DATABASE_URL,
           autoLoadEntities: true,
-          synchronize: false,
+          synchronize: true, // TODO: Set to false in production - use migrations instead
           logging: ['error', 'warn'], // Enable logging to debug connection issues
         };
         

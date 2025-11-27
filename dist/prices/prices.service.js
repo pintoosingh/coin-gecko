@@ -366,61 +366,177 @@ let PricesService = PricesService_1 = class PricesService {
                                 }
                             }
                         }
+                        if (!found && coinDetailsData && coinDetailsData.market_data) {
+                            const md = coinDetailsData.market_data;
+                            liveData = {
+                                id: coinDetailsData.id,
+                                symbol: coinDetailsData.symbol,
+                                name: coinDetailsData.name,
+                                image: coinDetailsData.image?.large || coinDetailsData.image?.small || coinDetailsData.image?.thumb,
+                                current_price: md.current_price?.usd || null,
+                                market_cap: md.market_cap?.usd || null,
+                                market_cap_rank: md.market_cap_rank || null,
+                                fully_diluted_valuation: md.fully_diluted_valuation?.usd || null,
+                                total_volume: md.total_volume?.usd || null,
+                                high_24h: md.high_24h?.usd || null,
+                                low_24h: md.low_24h?.usd || null,
+                                price_change_24h: md.price_change_24h || null,
+                                price_change_percentage_24h: md.price_change_percentage_24h || null,
+                                market_cap_change_24h: md.market_cap_change_24h || null,
+                                market_cap_change_percentage_24h: md.market_cap_change_percentage_24h || null,
+                                circulating_supply: md.circulating_supply || null,
+                                total_supply: md.total_supply || null,
+                                max_supply: md.max_supply || null,
+                                ath: md.ath?.usd || null,
+                                ath_change_percentage: md.ath_change_percentage?.usd || null,
+                            };
+                        }
+                        if (liveData) {
+                            liveData.__coinDetailsData = coinDetailsData;
+                        }
                     }
                     catch (err) {
-                        this.logger.warn(`Failed to check database for static data: ${err.message}`);
+                        this.logger.warn(`Failed to fetch coin details for ${coinId}: ${err.message}`);
                     }
                 }
-                if (!found && coinDetailsData && coinDetailsData.market_data) {
-                    const md = coinDetailsData.market_data;
-                    liveData = {
-                        id: coinDetailsData.id,
-                        symbol: coinDetailsData.symbol,
-                        name: coinDetailsData.name,
-                        image: coinDetailsData.image?.large || coinDetailsData.image?.small || coinDetailsData.image?.thumb,
-                        current_price: md.current_price?.usd || null,
-                        market_cap: md.market_cap?.usd || null,
-                        market_cap_rank: md.market_cap_rank || null,
-                        fully_diluted_valuation: md.fully_diluted_valuation?.usd || null,
-                        total_volume: md.total_volume?.usd || null,
-                        high_24h: md.high_24h?.usd || null,
-                        low_24h: md.low_24h?.usd || null,
-                        price_change_24h: md.price_change_24h || null,
-                        price_change_percentage_24h: md.price_change_percentage_24h || null,
-                        market_cap_change_24h: md.market_cap_change_24h || null,
-                        market_cap_change_percentage_24h: md.market_cap_change_percentage_24h || null,
-                        circulating_supply: md.circulating_supply || null,
-                        total_supply: md.total_supply || null,
-                        max_supply: md.max_supply || null,
-                        ath: md.ath?.usd || null,
-                        ath_change_percentage: md.ath_change_percentage?.usd || null,
-                    };
-                }
                 if (liveData) {
-                    liveData.__coinDetailsData = coinDetailsData;
+                    try {
+                        const client = this.ensureRedis();
+                        if (client) {
+                            const dataToCache = { ...liveData };
+                            delete dataToCache.__coinDetailsData;
+                            await client.set(key, JSON.stringify(dataToCache), 'EX', this.ttl);
+                        }
+                    }
+                    catch (err) {
+                        this.logger.debug('Failed to cache fallback market: ' + err.message);
+                    }
                 }
             }
             catch (err) {
-                this.logger.warn(`Failed to fetch coin details for ${coinId}: ${err.message}`);
+                this.logger.error('fallback fetch failed', err);
+                throw err;
             }
         }
-        if (liveData) {
-            try {
-                const client = this.ensureRedis();
-                if (client) {
-                    const dataToCache = { ...liveData };
-                    delete dataToCache.__coinDetailsData;
-                    await client.set(key, JSON.stringify(dataToCache), 'EX', this.ttl);
+        const coinDetailsData = liveData.__coinDetailsData;
+        delete liveData.__coinDetailsData;
+        return this.mergeWithStaticData(liveData, symbol, coinDetailsData);
+    }
+    async getAllPrices() {
+        const key = this.allKey();
+        let combined = [];
+        try {
+            const client = this.ensureRedis();
+            if (client) {
+                const cached = await client.get(key);
+                if (cached) {
+                    try {
+                        combined = JSON.parse(cached);
+                    }
+                    catch (e) {
+                    }
                 }
             }
-            catch (err) {
-                this.logger.debug('Failed to cache fallback market: ' + err.message);
+            else {
+                this.logger.debug('Redis not available in getAllPrices — falling back to direct fetch');
             }
+        }
+        catch (err) {
+            this.logger.warn('Redis get error for allKey: ' + err.message);
+        }
+        if (combined.length === 0) {
+            for (let page = 1; page <= this.maxPages; page++) {
+                try {
+                    const data = await this.cg.coinsMarkets(page);
+                    if (!data || data.length === 0)
+                        break;
+                    combined.push(...data);
+                    if (data.length < Number(process.env.PER_PAGE || 250))
+                        break;
+                }
+                catch (err) {
+                    this.logger.error(`failed fetching page ${page}`, err);
+                    break;
+                }
+            }
+            if (combined.length) {
+                try {
+                    const client = this.ensureRedis();
+                    if (client) {
+                        await client.set(key, JSON.stringify(combined), 'EX', this.ttl);
+                        const pipeline = client.pipeline();
+                        for (const m of combined) {
+                            const k = this.priceKey(m.symbol);
+                            pipeline.set(k, JSON.stringify(m), 'EX', this.ttl);
+                        }
+                        await pipeline.exec();
+                    }
+                    else {
+                        this.logger.debug('Redis not available — skipping caching of combined results');
+                    }
+                }
+                catch (err) {
+                    this.logger.warn('Failed caching combined markets: ' + err.message);
+                }
+            }
+        }
+        try {
+            const tokens = await this.tokenRepo.find();
+            const tokenMap = new Map(tokens.map(t => [t.symbol.toUpperCase(), t]));
+            return combined.map((liveData) => {
+                const symbol = liveData.symbol?.toUpperCase();
+                const token = symbol ? tokenMap.get(symbol) : null;
+                return this.formatResponse(liveData, token || null);
+            });
+        }
+        catch (err) {
+            this.logger.warn('Failed to merge static data: ' + err.message);
+            return combined.map((liveData) => this.formatResponse(liveData));
         }
     }
-    catch(err) {
-        this.logger.error('fallback fetch failed', err);
-        throw err;
+    startPoller() {
+        const targetIds = ['bitcoin', 'ethereum', 'solana'];
+        const runOnce = async () => {
+            this.logger.debug('poller tick - fetching prices for bitcoin, ethereum, solana');
+            try {
+                const markets = await this.cg.coinsMarkets(1, targetIds);
+                if (!markets || markets.length === 0) {
+                    this.logger.warn('No market data returned for target tokens');
+                    return;
+                }
+                const client = this.ensureRedis();
+                if (client) {
+                    try {
+                        const pipeline = client.pipeline();
+                        for (const m of markets) {
+                            if (m.symbol) {
+                                pipeline.set(this.priceKey(m.symbol), JSON.stringify(m), 'EX', this.ttl);
+                            }
+                        }
+                        await pipeline.exec();
+                        this.logger.debug(`Cached ${markets.length} tokens in Redis`);
+                    }
+                    catch (err) {
+                        this.logger.warn('Failed to write markets to Redis pipeline: ' + err.message);
+                    }
+                }
+                else {
+                    this.logger.debug('Redis not available while polling; skipping caching');
+                }
+            }
+            catch (err) {
+                this.logger.error('poller error', err);
+            }
+        };
+        runOnce().catch((e) => this.logger.error('initial poller run failed', e));
+        this.poller = setInterval(async () => {
+            try {
+                await runOnce();
+            }
+            catch (err) {
+                this.logger.error('poller periodic run failed', err);
+            }
+        }, this.intervalMs);
     }
 };
 exports.PricesService = PricesService;
@@ -431,126 +547,4 @@ exports.PricesService = PricesService = PricesService_1 = __decorate([
         coingecko_service_1.CoingeckoService,
         typeorm_2.Repository])
 ], PricesService);
-const coinDetailsData = liveData.__coinDetailsData;
-delete liveData.__coinDetailsData;
-return this.mergeWithStaticData(liveData, symbol, coinDetailsData);
-async;
-getAllPrices();
-{
-    const key = this.allKey();
-    let combined = [];
-    try {
-        const client = this.ensureRedis();
-        if (client) {
-            const cached = await client.get(key);
-            if (cached) {
-                try {
-                    combined = JSON.parse(cached);
-                }
-                catch (e) {
-                }
-            }
-        }
-        else {
-            this.logger.debug('Redis not available in getAllPrices — falling back to direct fetch');
-        }
-    }
-    catch (err) {
-        this.logger.warn('Redis get error for allKey: ' + err.message);
-    }
-    if (combined.length === 0) {
-        for (let page = 1; page <= this.maxPages; page++) {
-            try {
-                const data = await this.cg.coinsMarkets(page);
-                if (!data || data.length === 0)
-                    break;
-                combined.push(...data);
-                if (data.length < Number(process.env.PER_PAGE || 250))
-                    break;
-            }
-            catch (err) {
-                this.logger.error(`failed fetching page ${page}`, err);
-                break;
-            }
-        }
-        if (combined.length) {
-            try {
-                const client = this.ensureRedis();
-                if (client) {
-                    await client.set(key, JSON.stringify(combined), 'EX', this.ttl);
-                    const pipeline = client.pipeline();
-                    for (const m of combined) {
-                        const k = this.priceKey(m.symbol);
-                        pipeline.set(k, JSON.stringify(m), 'EX', this.ttl);
-                    }
-                    await pipeline.exec();
-                }
-                else {
-                    this.logger.debug('Redis not available — skipping caching of combined results');
-                }
-            }
-            catch (err) {
-                this.logger.warn('Failed caching combined markets: ' + err.message);
-            }
-        }
-    }
-    try {
-        const tokens = await this.tokenRepo.find();
-        const tokenMap = new Map(tokens.map(t => [t.symbol.toUpperCase(), t]));
-        return combined.map((liveData) => {
-            const symbol = liveData.symbol?.toUpperCase();
-            const token = symbol ? tokenMap.get(symbol) : null;
-            return this.formatResponse(liveData, token || null);
-        });
-    }
-    catch (err) {
-        this.logger.warn('Failed to merge static data: ' + err.message);
-        return combined.map((liveData) => this.formatResponse(liveData));
-    }
-}
-startPoller();
-{
-    const targetIds = ['bitcoin', 'ethereum', 'solana'];
-    const runOnce = async () => {
-        this.logger.debug('poller tick - fetching prices for bitcoin, ethereum, solana');
-        try {
-            const markets = await this.cg.coinsMarkets(1, targetIds);
-            if (!markets || markets.length === 0) {
-                this.logger.warn('No market data returned for target tokens');
-                return;
-            }
-            const client = this.ensureRedis();
-            if (client) {
-                try {
-                    const pipeline = client.pipeline();
-                    for (const m of markets) {
-                        if (m.symbol) {
-                            pipeline.set(this.priceKey(m.symbol), JSON.stringify(m), 'EX', this.ttl);
-                        }
-                    }
-                    await pipeline.exec();
-                    this.logger.debug(`Cached ${markets.length} tokens in Redis`);
-                }
-                catch (err) {
-                    this.logger.warn('Failed to write markets to Redis pipeline: ' + err.message);
-                }
-            }
-            else {
-                this.logger.debug('Redis not available while polling; skipping caching');
-            }
-        }
-        catch (err) {
-            this.logger.error('poller error', err);
-        }
-    };
-    runOnce().catch((e) => this.logger.error('initial poller run failed', e));
-    this.poller = setInterval(async () => {
-        try {
-            await runOnce();
-        }
-        catch (err) {
-            this.logger.error('poller periodic run failed', err);
-        }
-    }, this.intervalMs);
-}
 //# sourceMappingURL=prices.service.js.map

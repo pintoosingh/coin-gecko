@@ -472,10 +472,6 @@ export class PricesService implements OnModuleInit, OnModuleDestroy {
                 }
               }
             }
-          } catch (err) {
-            this.logger.warn(`Failed to check database for static data: ${(err as any).message}`);
-          }
-        }
             
             // If we didn't find it in markets, use coin details for live data
             if (!found && coinDetailsData && coinDetailsData.market_data) {

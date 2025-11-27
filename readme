@@ -1,0 +1,551 @@
+# Cryptocurrency Price Tracking Service
+
+A NestJS microservice for tracking cryptocurrency prices with real-time updates and Redis caching.
+
+## Overview
+
+This service polls CoinGecko's API to fetch cryptocurrency market data, caches it in Redis for fast access, and stores static token metadata in PostgreSQL. **Only static data is saved to the database** - live price data is served from Redis cache only.
+
+### Features
+
+- ✅ **Real-time Price Updates**: Polls CoinGecko API every 20 seconds (configurable) for **bitcoin, ethereum, solana only**
+- ✅ **Redis Caching**: Sub-second access to cached price data (30s TTL for prices, 1 hour for coin details)
+- ✅ **Static Data Storage**: Token metadata (logo, social links, categories, contract_address) stored in PostgreSQL
+- ✅ **Live Data**: Served from Redis cache only (NOT persisted to database)
+- ✅ **Static Token Metadata**: Stores token logos, social links, categories, contract_address, etc. in database
+- ✅ **Daily Market Cap Refresh**: Market cap field updated every 24 hours in database (static snapshot)
+- ✅ **Database-First Lookup**: Ensures correct token selection (e.g., Solana instead of Wrapped SOL)
+- ✅ **Filtered API Response**: Returns only specified fields for both live and static data
+
+---
+
+## Architecture
+
+### System Architecture Diagram
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        Client Applications                      │
+└────────────────────────────┬────────────────────────────────────┘
+                             │
+                             │ HTTP REST API
+                             │
+┌────────────────────────────▼────────────────────────────────────┐
+│                    PricesController (NestJS)                    │
+│  ┌──────────────┐  ┌──────────────┐                             │
+│  │ GET /prices  │  │ GET /:symbol │                             │
+│  └──────────────┘  └──────────────┘                             │
+└────────────────────────────┬────────────────────────────────────┘
+                             │
+        ┌────────────────────┼────────────────────┐
+        │                    │                    │
+┌───────▼────────┐  ┌────────▼────────┐  ┌────────▼────────┐
+│ PricesService  │  │CoingeckoService │  │  Seed Script    │
+│                │  │                 │  │                 │
+│ - Cache-first  │  │ - API Client    │  │ - Static Data   │
+│ - Polling      │  │ - Retry Logic   │  │ - One-time Seed │
+└───────┬────────┘  └────────┬────────┘  └────────┬────────┘
+        │                    │                    │
+        │                    │                    │
+┌───────▼────────┐  ┌────────▼────────┐  ┌────────▼────────┐
+│   Redis Cache  │  │  PostgreSQL DB  │  │  CoinGecko API  │
+│                │  │                 │  │                 │
+│ - price:{sym}  │  │ - tokens        │  │ - /coins/markets│
+│ - prices:all   │  │ (STATIC DATA)   │  │ - /coins/{id}   │
+│ (LIVE DATA)    │  │                 │  │                 │
+└────────────────┘  └─────────────────┘  └─────────────────┘
+```
+
+### Data Flow
+
+#### 1. **Static Data Flow (One-time Seed)**
+```
+CoinGecko API (/coins/{id})
+  ↓
+Seed Script (npm run seed)
+  ↓
+PostgreSQL (tokens table) ✅ SAVED TO DB
+```
+
+#### 2. **Live Data Flow (Redis Cache Only)**
+```
+CoinGecko API (/coins/markets) - every 20 seconds
+  ↓
+PricesService Poller (bitcoin, ethereum, solana only)
+  ↓
+Redis Cache (30s TTL) ✅ ONLY IN CACHE
+  ↓
+API Response ✅ SERVED FROM CACHE
+  ↓
+NOT saved to database ❌
+```
+
+#### 3. **Market Cap Daily Refresh (Static Data)**
+```
+CoinGecko API (/coins/markets) - every 24 hours
+  ↓
+MarketCapSchedulerService
+  ↓
+PostgreSQL (tokens.market_cap) ✅ UPDATED IN DB
+  ↓
+Static snapshot (refreshed daily)
+```
+
+#### 4. **API Request Flow**
+
+#### 5. **API Request Flow**
+```
+Client Request → PricesController → PricesService
+                                      ↓
+                              Check Database First
+                                      ↓
+                          [Found in DB] → Use coingecko_id
+                          [Not in DB] → Search CoinGecko
+                                      ↓
+                              Check Redis Cache
+                                      ↓
+                          [Cache Hit] → Return Cached Data
+                          [Cache Miss] → Fetch from CoinGecko → Cache → Return
+                                      ↓
+                              Merge Static Data (contract_address, categories)
+```
+
+### Component Architecture
+
+#### **Layers**
+
+1. **Controller Layer** (`PricesController`)
+   - Handles HTTP requests
+   - Input validation and parameter extraction
+   - Response formatting
+
+2. **Service Layer**
+   - **PricesService**: Core business logic for price fetching and caching
+   - **CoingeckoService**: External API integration
+
+3. **Data Layer**
+   - **Redis**: Caching layer for live price data (NOT persisted to DB)
+   - **PostgreSQL**: Persistent storage for static data only (tokens table)
+
+4. **Entity Layer**
+   - **Token**: Static token metadata (saved to database)
+
+### Key Components
+
+#### **PricesService**
+- **Purpose**: Main service for price data management
+- **Responsibilities**:
+  - Polls CoinGecko API at configured intervals (every 20 seconds) for **bitcoin, ethereum, solana only**
+  - Checks database first to ensure correct token selection
+  - Manages Redis cache (read/write) for live price data (30s TTL) and coin details (1 hour TTL)
+  - Provides cache-first data retrieval with database fallback
+  - Merges live data with static data (contract_address, categories) from database
+  - **Note**: Live data is NOT saved to database, only cached in Redis
+
+#### **MarketCapSchedulerService**
+- **Purpose**: Daily market cap refresh for static data
+- **Responsibilities**:
+  - Updates `market_cap` field in `tokens` table every 24 hours
+  - Only processes **bitcoin, ethereum, solana**
+  - Fetches market data from CoinGecko and updates database
+  - Runs automatically on service startup and then every 24 hours
+
+#### **CoingeckoService**
+- **Purpose**: CoinGecko API client
+- **Responsibilities**:
+  - HTTP requests to CoinGecko API
+  - Retry logic with exponential backoff
+  - Rate limit handling
+  - Error management
+
+---
+
+## API Endpoints
+
+### Real-time Price Data (from Redis Cache)
+
+#### `GET /prices`
+Retrieves all cached token prices from Redis.
+
+**Response**: Array of market data objects
+```json
+[
+  {
+    "id": "bitcoin",
+    "symbol": "btc",
+    "name": "Bitcoin",
+    "current_price": 43250.50,
+    "market_cap": 850000000000,
+    ...
+  }
+]
+```
+
+**Note**: Data is served from Redis cache (30s TTL), NOT from database.
+
+**Response Format** (filtered to only include these fields):
+```json
+{
+  "symbol": "btc",
+  "name": "Bitcoin",
+  "image": "https://...",
+  "current_price": 43250.50,
+  "market_cap": 850000000000,
+  "market_cap_rank": 1,
+  "fully_diluted_valuation": 908000000000,
+  "total_volume": 25000000000,
+  "high_24h": 44500.00,
+  "low_24h": 42000.00,
+  "price_change_24h": 1250.50,
+  "price_change_percentage_24h": 2.98,
+  "market_cap_change_24h": 25000000000,
+  "market_cap_change_percentage_24h": 3.03,
+  "circulating_supply": 19650000,
+  "total_supply": 19650000,
+  "max_supply": 21000000,
+  "ath": 69000.00,
+  "ath_change_percentage": -37.32,
+  "contract_address": {
+    "ethereum": "0x2260fac5e5542a773aa44fbcfedf7c193bc2c599"
+  },
+  "categories": ["Layer 1 (L1)", "PoW"]
+}
+```
+
+#### `GET /prices/:symbol`
+Retrieves current price data for a specific token from Redis cache.
+
+**Parameters**:
+- `symbol` (path): Token symbol (e.g., 'BTC', 'ETH')
+
+**Response**: Market data object for the specified token (from Redis cache)
+
+**Note**: Live price data is NOT stored in database, only cached in Redis.
+
+#### `GET /prices/:symbol/history?days=N`
+Retrieves price data for a token from Redis cache.
+
+**Parameters**:
+- `symbol` (path): Token symbol (e.g., 'BTC', 'ETH')
+- `days` (query, optional): Number of days (ignored - returns current data only)
+
+**Response**: Array containing current price data from Redis cache
+```json
+[
+  {
+    "id": "bitcoin",
+    "symbol": "btc",
+    "name": "Bitcoin",
+    "current_price": 43250.50,
+    "market_cap": 850000000000,
+    ...
+  }
+]
+```
+
+**Note**: Historical data is NOT stored in database. This endpoint returns current cached data only (wrapped in array for compatibility).
+
+#### `GET /prices/:symbol/latest`
+Retrieves the latest price data from Redis cache.
+
+**Parameters**:
+- `symbol` (path): Token symbol (e.g., 'BTC', 'ETH', 'SOL')
+
+**Response**: Latest price data object from Redis cache (same as `GET /prices/:symbol`)
+
+**Note**: Returns current cached data, NOT from database (no historical storage).
+
+#### `GET /prices/:symbol/metadata`
+Retrieves static metadata for a specific token from database only (no live price data).
+
+**Parameters**:
+- `symbol` (path): Token symbol (e.g., 'BTC', 'ETH', 'SOL')
+
+**Response**: Static metadata object from database
+```json
+{
+  "symbol": "SOL",
+  "name": "Solana",
+  "logo": "https://...",
+  "image_url": "https://...",
+  "social_links": {
+    "twitter": "https://twitter.com/solana",
+    "homepage": "https://solana.com/"
+  },
+  "about": "Solana is a highly functional...",
+  "contract_address": {
+    "ethereum": "0x...",
+    "solana": "..."
+  },
+  "categories": ["Smart Contract Platform", "Layer 1 (L1)", ...]
+}
+```
+
+**Note**: Returns only static data from database (contract_address, categories, social_links, etc.). No live price data.
+
+---
+
+## Database Schema
+
+### `tokens` Table (Static Data)
+Stores static token metadata that doesn't change frequently. Currently supports **bitcoin, ethereum, solana** only.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| id | UUID | Primary key |
+| symbol | VARCHAR(50) | Token symbol (unique, indexed) |
+| coingecko_id | VARCHAR(200) | CoinGecko coin ID (used for API lookups) |
+| name | VARCHAR(200) | Token name |
+| logo | TEXT | Logo URL (thumb) |
+| image_url | TEXT | Large image URL |
+| social_links | JSONB | Social media links (Twitter, homepage, etc.) |
+| about | TEXT | Token description |
+| category | VARCHAR(200) | Category (legacy field, comma-separated) |
+| smart_contract_address | VARCHAR(255) | Smart contract address (legacy field, Ethereum only) |
+| **contract_address** | **JSONB** | **Contract addresses per network** `{"ethereum": "0x...", "solana": "..."}` |
+| **categories** | **JSONB** | **Array of categories** `["Smart Contract Platform", "Layer 1 (L1)", ...]` |
+| **market_cap** | **DECIMAL(30,2)** | **Market capitalization (refreshed every 24 hours)** |
+| created_at | TIMESTAMP | Creation timestamp |
+| updated_at | TIMESTAMP | Last update timestamp |
+
+**Note**: 
+- `contract_address` stores addresses for multiple networks (JSON object)
+- `categories` stores an array of category strings (JSON array)
+- `market_cap` is updated daily by `MarketCapSchedulerService` (static snapshot)
+
+### Live Price Data (NOT in Database)
+Live price data is **NOT stored in the database**. It is only cached in Redis with a 30-second TTL.
+
+**Storage**: Redis cache only  
+**Fields** (available via API from Redis, filtered response):
+- symbol, name, image
+- current_price, market_cap, market_cap_rank
+- fully_diluted_valuation, total_volume
+- high_24h, low_24h
+- price_change_24h, price_change_percentage_24h
+- market_cap_change_24h, market_cap_change_percentage_24h
+- circulating_supply, total_supply, max_supply
+- ath, ath_change_percentage
+- **contract_address** (merged from database or CoinGecko)
+- **categories** (merged from database or CoinGecko)
+
+**Note**: 
+- Only static data is saved to the database. Live price data is served from Redis cache only.
+- API response is filtered to only include the above fields.
+- `contract_address` and `categories` are merged from database (if available) or fetched from CoinGecko.
+
+---
+
+## Configuration
+
+### Environment Variables
+
+Create a `.env` file with the following variables:
+
+```env
+# Database
+DATABASE_URL=postgresql://user:password@localhost:5432/pricesdb
+
+# Redis
+REDIS_URL=redis://localhost:6379
+REDIS_HOST=localhost
+REDIS_PORT=6379
+
+# CoinGecko API
+COINGECKO_BASE=https://api.coingecko.com/api/v3
+VS_CURRENCY=usd
+PER_PAGE=250
+COINGECKO_MAX_PAGES=5
+
+# Price Update Settings
+PRICE_UPDATE_INTERVAL_MS=20000        # Polling interval (20 seconds)
+PRICE_CACHE_TTL_SECONDS=30           # Redis cache TTL (30 seconds)
+
+# Seed Script
+SEED_IDS=bitcoin,ethereum,solana      # Comma-separated CoinGecko IDs (defaults to these 3)
+
+# Token Support
+# Currently only supports: bitcoin, ethereum, solana
+# Poller and scheduler are configured to only process these 3 tokens
+```
+
+---
+
+## Installation & Setup
+
+### Prerequisites
+- Node.js 18+
+- PostgreSQL 15+
+- Redis 7+
+- Docker & Docker Compose (optional)
+
+### Local Development
+
+1. **Clone and install dependencies**
+   ```bash
+   npm install
+   ```
+
+2. **Start services with Docker Compose**
+   ```bash
+   docker-compose up -d
+   ```
+   This starts PostgreSQL and Redis containers.
+
+3. **Create database tables**
+   Run the SQL migration (see Database Schema section) or temporarily enable `synchronize: true` in `app.module.ts` for development.
+
+4. **Configure environment**
+   Create `.env` file from `.env.example` and set your configuration.
+
+5. **Seed static token data (optional)**
+   ```bash
+   npm run seed
+   ```
+
+6. **Start the application**
+   ```bash
+   npm run start:dev
+   ```
+
+The service will start on `http://localhost:3000`
+
+---
+
+## Usage Examples
+
+### Get All Prices
+```bash
+curl http://localhost:3000/prices
+```
+
+### Get Specific Token Price
+```bash
+curl http://localhost:3000/prices/BTC
+```
+
+### Get Price History (Current Data)
+```bash
+# Returns current cached data (historical data not stored)
+curl http://localhost:3000/prices/BTC/history?days=7
+```
+
+### Get Latest Price
+```bash
+# Returns latest cached data (same as /prices/:symbol)
+curl http://localhost:3000/prices/BTC/latest
+```
+
+
+---
+
+## Data Flow Details
+
+### Static Data (One-time Seed)
+1. Run seed script: `npm run seed`
+2. Script fetches token details from CoinGecko `/coins/{id}` endpoint
+3. Extracts: logo, image_url, social_links, about, category, smart_contract_address
+4. Stores in `tokens` table
+5. This data rarely changes, so it's seeded once
+
+### Live Data (Redis Cache Only)
+1. **Polling**: `PricesService` polls CoinGecko every 20 seconds
+2. **Caching**: Fetched data is cached in Redis with 30s TTL
+3. **Storage**: Live data is **NOT saved to database** - only cached in Redis
+4. **API**: Serves live data from Redis cache only
+
+---
+
+## Performance Considerations
+
+### Caching Strategy
+- **Redis Cache**: 
+  - Price data: 30-second TTL provides sub-second response times
+  - Coin details: 1-hour TTL (static data doesn't change often)
+  - Coins list: 1-hour in-memory cache (10,000+ coins)
+- **Cache Keys**: 
+  - `price:{symbol}` - Individual token prices (bitcoin, ethereum, solana only)
+  - `coin:details:{coinId}` - Coin details with contract_address and categories (1 hour TTL)
+  - `prices:all` - Aggregated all prices (if using getAllPrices endpoint)
+
+### Rate Limiting
+- CoinGecko free tier has rate limits
+- Polling interval: 20 seconds (configurable)
+- 200ms delay between page fetches
+- Retry logic with exponential backoff
+
+### Database Optimization
+- Index on `symbol` in `tokens` table for fast lookups
+- Only static data stored in database (minimal storage)
+- Live data in Redis cache (no database overhead)
+- Database-first lookup ensures correct token selection (e.g., Solana vs Wrapped SOL)
+
+### Token Selection
+- **Supported Tokens**: Only **bitcoin, ethereum, solana** are actively polled and cached
+- **Database Priority**: When fetching by symbol, database is checked first to get correct `coingecko_id`
+- **Fallback Logic**: If not in database, searches CoinGecko markets (prioritizes highest market cap)
+- **Cache Validation**: If cached data doesn't match database token, cache is invalidated
+
+---
+
+## Monitoring & Logging
+
+The service uses NestJS Logger for structured logging:
+
+- **Debug**: Cache operations, polling ticks
+- **Info**: Successful operations, job scheduling
+- **Warn**: Redis connection issues, API retries
+- **Error**: Failed API calls, database errors, job failures
+
+---
+
+## Notes
+
+- **Static Data Only**: Only static token metadata is saved to the database (tokens table)
+- **Live Data**: Live price data is served from Redis cache only, NOT persisted to database
+- **Supported Tokens**: Currently only **bitcoin, ethereum, solana** are supported
+  - Poller only fetches these 3 tokens
+  - Market cap scheduler only updates these 3 tokens
+  - Database-first lookup ensures correct token selection
+- **Market Cap**: Updated daily in database (static snapshot, refreshed every 24 hours)
+- **Response Format**: API responses are filtered to only include specified fields
+- **Contract Address**: Stored as JSONB with multiple networks: `{"ethereum": "0x...", "solana": "..."}`
+- **Categories**: Stored as JSONB array: `["Smart Contract Platform", "Layer 1 (L1)", ...]`
+- CoinGecko free API rate limits exist. The service is optimized for 3 tokens only.
+- For production, disable `synchronize` in TypeORM and use proper migrations.
+- Consider using CoinGecko Pro API for higher rate limits in production.
+- Redis is required for live price data (serves API requests).
+
+---
+
+## Mapping Fields Requirements
+
+### From `coins/markets` (Live Data)
+All these fields are present in the cached market object:
+- symbol, name, image, current_price, market_cap, market_cap_rank
+- fully_diluted_valuation, total_volume, high_24h, low_24h
+- price_change_24h, price_change_percentage_24h
+- market_cap_change_24h, market_cap_change_percentage_24h
+- circulating_supply, total_supply, max_supply
+- ath, ath_change_percentage
+
+### From `coins/{id}` (Static Data)
+For `contract_address` and `categories`, use data from `GET /coins/{id}` endpoint (see seed script for extraction).
+
+**contract_address**: Extracted from `contract_addresses` or `platforms` field in CoinGecko response
+- Stored as JSONB: `{"ethereum": "0x...", "solana": "...", "arbitrum-one": "0x..."}`
+- Networks without addresses are excluded
+
+**categories**: Extracted from `categories` array in CoinGecko response
+- Stored as JSONB array: `["Smart Contract Platform", "Layer 1 (L1)", "Ethereum Ecosystem", ...]`
+- Empty arrays are stored as `null`
+
+**market_cap**: Updated daily from `/coins/markets` endpoint
+- Stored as DECIMAL(30,2) in `tokens.market_cap`
+- Refreshed every 24 hours by `MarketCapSchedulerService`
+
+---
+
+## License
+
+MIT

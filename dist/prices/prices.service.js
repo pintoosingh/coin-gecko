@@ -29,7 +29,7 @@ let PricesService = PricesService_1 = class PricesService {
         this.redis = null;
         this.poller = null;
         this.ttl = Number(process.env.PRICE_CACHE_TTL_SECONDS || 30);
-        this.intervalMs = Number(process.env.PRICE_UPDATE_INTERVAL_MS || 20000);
+        this.intervalMs = Number(process.env.PRICE_UPDATE_INTERVAL_MS || 60000);
         this.maxPages = Number(process.env.COINGECKO_MAX_PAGES || 5);
     }
     onModuleInit() {
@@ -525,7 +525,18 @@ let PricesService = PricesService_1 = class PricesService {
                 }
             }
             catch (err) {
-                this.logger.error('poller error', err);
+                if (err?.response?.status === 429) {
+                    const retryAfter = err?.response?.headers?.['retry-after'];
+                    if (retryAfter) {
+                        this.logger.warn(`Rate limit hit. Retry after ${retryAfter} seconds. Skipping this poll cycle.`);
+                    }
+                    else {
+                        this.logger.warn('Rate limit hit. Skipping this poll cycle.');
+                    }
+                }
+                else {
+                    this.logger.error('poller error', err);
+                }
             }
         };
         runOnce().catch((e) => this.logger.error('initial poller run failed', e));

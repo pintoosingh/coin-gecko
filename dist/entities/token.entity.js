@@ -19,13 +19,13 @@ __decorate([
     __metadata("design:type", String)
 ], Token.prototype, "id", void 0);
 __decorate([
-    (0, typeorm_1.Index)({ unique: true }),
+    (0, typeorm_1.Index)(),
     (0, typeorm_1.Column)({ type: 'varchar', length: 50 }),
     __metadata("design:type", String)
 ], Token.prototype, "symbol", void 0);
 __decorate([
-    (0, typeorm_1.Index)(),
-    (0, typeorm_1.Column)({ type: 'varchar', length: 200, nullable: true }),
+    (0, typeorm_1.Index)({ unique: true }),
+    (0, typeorm_1.Column)({ type: 'varchar', length: 200, nullable: false }),
     __metadata("design:type", String)
 ], Token.prototype, "coingecko_id", void 0);
 __decorate([

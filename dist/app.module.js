@@ -10,6 +10,7 @@ exports.AppModule = void 0;
 const common_1 = require("@nestjs/common");
 const config_1 = require("@nestjs/config");
 const typeorm_1 = require("@nestjs/typeorm");
+const bullmq_1 = require("@nestjs/bullmq");
 const prices_module_1 = require("./prices/prices.module");
 const common_module_1 = require("./common/common.module");
 const token_entity_1 = require("./entities/token.entity");
@@ -22,6 +23,38 @@ exports.AppModule = AppModule = __decorate([
         imports: [
             config_1.ConfigModule.forRoot({ isGlobal: true, envFilePath: '.env' }),
             common_module_1.CommonModule,
+            bullmq_1.BullModule.forRootAsync({
+                useFactory: () => {
+                    const redisUrl = process.env.REDIS_URL || 'redis://localhost:6379';
+                    if (redisUrl.startsWith('redis://')) {
+                        try {
+                            const url = new URL(redisUrl);
+                            return {
+                                connection: {
+                                    host: url.hostname || 'localhost',
+                                    port: parseInt(url.port || '6379', 10),
+                                    password: url.password || undefined,
+                                    db: 0,
+                                },
+                            };
+                        }
+                        catch (err) {
+                            return {
+                                connection: {
+                                    host: 'localhost',
+                                    port: 6379,
+                                },
+                            };
+                        }
+                    }
+                    return {
+                        connection: {
+                            host: 'localhost',
+                            port: 6379,
+                        },
+                    };
+                },
+            }),
             typeorm_1.TypeOrmModule.forRootAsync({
                 useFactory: () => {
                     const config = {

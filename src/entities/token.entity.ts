@@ -5,12 +5,12 @@ export class Token {
   @PrimaryGeneratedColumn('uuid')
   id: string;
 
-  @Index({ unique: true })
+  @Index()
   @Column({ type: 'varchar', length: 50 })
   symbol: string;
 
-  @Index()
-  @Column({ type: 'varchar', length: 200, nullable: true })
+  @Index({ unique: true })
+  @Column({ type: 'varchar', length: 200, nullable: false })
   coingecko_id: string;
 
   @Column({ type: 'text', nullable: true })

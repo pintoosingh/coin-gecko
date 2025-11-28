@@ -12,7 +12,7 @@ export class PricesService implements OnModuleInit, OnModuleDestroy {
   private redis: Redis | null = null;
   private poller: NodeJS.Timeout | null = null;
   private readonly ttl = Number(process.env.PRICE_CACHE_TTL_SECONDS || 30);
-  private readonly intervalMs = Number(process.env.PRICE_UPDATE_INTERVAL_MS || 20000);
+  private readonly intervalMs = Number(process.env.PRICE_UPDATE_INTERVAL_MS || 60000); // Default: 60 seconds (was 20s)
   private readonly maxPages = Number(process.env.COINGECKO_MAX_PAGES || 5);
 
   constructor(
@@ -663,8 +663,19 @@ export class PricesService implements OnModuleInit, OnModuleDestroy {
 
         // Live price data is cached in Redis for fast access (NOT saved to database)
         // Only static token metadata (tokens table) is saved to database
-      } catch (err) {
-        this.logger.error('poller error', err);
+      } catch (err: any) {
+        // Handle rate limits gracefully - don't treat as critical error
+        if (err?.response?.status === 429) {
+          const retryAfter = err?.response?.headers?.['retry-after'];
+          if (retryAfter) {
+            this.logger.warn(`Rate limit hit. Retry after ${retryAfter} seconds. Skipping this poll cycle.`);
+          } else {
+            this.logger.warn('Rate limit hit. Skipping this poll cycle.');
+          }
+          // Skip this cycle - next poll will retry
+        } else {
+          this.logger.error('poller error', err);
+        }
       }
     };
 

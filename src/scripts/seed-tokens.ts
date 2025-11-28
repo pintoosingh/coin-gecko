@@ -65,9 +65,66 @@ async function main() {
   const repo = ds.getRepository(Token);
   const cg = new CoingeckoService();
 
-  // example list - supply list of coingecko ids you care about
-  const ids = (process.env.SEED_IDS && process.env.SEED_IDS.split(',')) || ['bitcoin','ethereum','solana'];
-  for (const id of ids) {
+  // Check command line arguments
+  const seedSpecific = process.argv.includes('--specific');
+  
+  // Check if specific IDs are provided
+  const seedIdsRaw = process.env.SEED_IDS;
+  const seedIds = seedIdsRaw ? seedIdsRaw.split(',').map(id => id.trim()).filter(id => id.length > 0) : null;
+  
+  let coinIds: string[] = [];
+  
+  // Default behavior: seed ALL coins
+  // Only seed specific coins if --specific flag is used AND SEED_IDS is set
+  const useSpecificIds = seedSpecific && seedIds && seedIds.length > 0;
+  
+  if (useSpecificIds) {
+    // Use specific IDs if --specific flag is used
+    coinIds = seedIds;
+    console.log(`Seeding ${coinIds.length} specific tokens: ${coinIds.join(', ')}`);
+  } else {
+    // Fetch all coins from CoinGecko markets
+    console.log('Fetching all coins from CoinGecko markets...');
+    const maxPages = Number(process.env.COINGECKO_MAX_PAGES || 5);
+    const perPage = Number(process.env.PER_PAGE || 250);
+    
+    const allCoinIds = new Set<string>();
+    
+    for (let page = 1; page <= maxPages; page++) {
+      try {
+        const markets = await cg.coinsMarkets(page);
+        if (!markets || markets.length === 0) break;
+        
+        // Extract coin IDs from market data
+        for (const market of markets) {
+          if (market.id) {
+            allCoinIds.add(market.id);
+          }
+        }
+        
+        console.log(`Fetched page ${page}: ${markets.length} coins (total unique: ${allCoinIds.size})`);
+        
+        // Gentle pause to avoid rate limits
+        await new Promise((res) => setTimeout(res, 200));
+        
+        // If we got less than perPage items, we've reached the end
+        if (markets.length < perPage) break;
+      } catch (err) {
+        console.error(`Failed to fetch page ${page}:`, (err as any).message);
+        break;
+      }
+    }
+    
+    coinIds = Array.from(allCoinIds);
+    console.log(`Total coins to seed: ${coinIds.length}`);
+  }
+  
+  // Process each coin
+  let seeded = 0;
+  let failed = 0;
+  
+  for (let i = 0; i < coinIds.length; i++) {
+    const id = coinIds[i];
     try {
       const details = await cg.coinDetails(id);
       const symbol = (details.symbol || '').toUpperCase();
@@ -119,12 +176,27 @@ async function main() {
         contract_address: contractAddresses,
         categories: categories
       };
-      await repo.upsert(meta as any, ['symbol']);
+      await repo.upsert(meta as any, ['coingecko_id']); // Use coingecko_id as unique identifier
+      seeded++;
       console.log('seeded', symbol);
+      
+      // Progress logging every 10 coins
+      if ((i + 1) % 10 === 0 || i + 1 === coinIds.length) {
+        console.log(`Progress: ${i + 1}/${coinIds.length} processed (${seeded} seeded, ${failed} failed)`);
+      }
+      
+      // Gentle pause to avoid rate limits
+      await new Promise((res) => setTimeout(res, 100));
     } catch (err) {
-      console.error('seed failed for', id, err.message);
+      console.error('seed failed for', id, (err as any).message);
+      failed++;
+      
+      // On error, wait a bit longer before continuing
+      await new Promise((res) => setTimeout(res, 500));
     }
   }
+  
+  console.log(`\nSeed completed: ${seeded} tokens seeded, ${failed} failed`);
 
   await ds.destroy();
   process.exit(0);

@@ -31,12 +31,19 @@ let TokenMetadataProcessor = TokenMetadataProcessor_1 = class TokenMetadataProce
         this.logger.log(`Processing token metadata job ${job.id} of type ${job.name}`);
         try {
             let coinIds = [];
+            let coinsWithPlatforms = null;
             try {
-                const allCoins = await this.cg.coinsList();
-                this.logger.log(`Fetched ${allCoins.length} coins from CoinGecko /coins/list endpoint`);
+                const allCoins = await this.cg.coinsList(true);
+                this.logger.log(`Fetched ${allCoins.length} coins from CoinGecko /coins/list endpoint (with platforms)`);
                 coinIds = allCoins
                     .map((coin) => coin.id)
                     .filter((id) => id && id.trim() !== '');
+                coinsWithPlatforms = new Map();
+                allCoins.forEach((coin) => {
+                    if (coin.id && coin.platforms) {
+                        coinsWithPlatforms.set(coin.id, coin);
+                    }
+                });
             }
             catch (err) {
                 this.logger.error(`Failed to fetch coins list: ${err.message}`);
@@ -79,9 +86,10 @@ let TokenMetadataProcessor = TokenMetadataProcessor_1 = class TokenMetadataProce
                     }
                     let contractAddresses = null;
                     let smartContractAddress = null;
-                    if (details.contract_addresses) {
+                    const coinFromList = coinsWithPlatforms?.get(coinId);
+                    if (coinFromList && coinFromList.platforms && typeof coinFromList.platforms === 'object') {
                         const filtered = {};
-                        for (const [network, address] of Object.entries(details.contract_addresses)) {
+                        for (const [network, address] of Object.entries(coinFromList.platforms)) {
                             if (address && typeof address === 'string' && address.trim() !== '') {
                                 filtered[network] = address;
                             }
@@ -91,6 +99,15 @@ let TokenMetadataProcessor = TokenMetadataProcessor_1 = class TokenMetadataProce
                     else if (details.platforms && typeof details.platforms === 'object') {
                         const filtered = {};
                         for (const [network, address] of Object.entries(details.platforms)) {
+                            if (address && typeof address === 'string' && address.trim() !== '') {
+                                filtered[network] = address;
+                            }
+                        }
+                        contractAddresses = Object.keys(filtered).length > 0 ? filtered : null;
+                    }
+                    else if (details.contract_addresses) {
+                        const filtered = {};
+                        for (const [network, address] of Object.entries(details.contract_addresses)) {
                             if (address && typeof address === 'string' && address.trim() !== '') {
                                 filtered[network] = address;
                             }

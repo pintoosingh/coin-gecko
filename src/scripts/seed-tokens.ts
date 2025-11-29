@@ -93,27 +93,205 @@ async function main() {
     }
     
     try {
-      // Use coinsList() which calls /coins/list endpoint - returns ALL coins
-      const allCoins = await cg.coinsList();
-      console.log(`Fetched ${allCoins.length} coins from CoinGecko /coins/list endpoint`);
+      // Use coinsList() with include_platform=true to get ALL coins with contract addresses
+      // This endpoint returns all coins in a single response (no pagination needed)
+      // Response includes: id, symbol, name, platforms (contract addresses)
       
-      // Extract coin IDs
-      coinIds = allCoins
-        .map((coin: any) => coin.id)
-        .filter((id: string) => id && id.trim() !== '');
+      // Add a small delay before making the request to avoid hitting rate limits
+      console.log('Waiting 5 seconds before making API request to avoid rate limits...');
+      await new Promise((res) => setTimeout(res, 5000));
+      
+      const allCoins = await cg.coinsList(true); // include_platform=true to get contract addresses
+      
+      // Verify response
+      if (!Array.isArray(allCoins)) {
+        throw new Error(`Invalid response format: expected array, got ${typeof allCoins}`);
+      }
+      
+      console.log(`Fetched ${allCoins.length} coins from CoinGecko /coins/list endpoint (with platforms)`);
       
       // Apply MAX_COINS limit if set
-      if (maxCoins && coinIds.length > maxCoins) {
-        coinIds = coinIds.slice(0, maxCoins);
+      let coinsToProcess = allCoins;
+      if (maxCoins && allCoins.length > maxCoins) {
+        coinsToProcess = allCoins.slice(0, maxCoins);
         console.log(`Limited to ${maxCoins} coins (MAX_COINS limit)`);
       }
       
-      console.log(`Total coins to seed: ${coinIds.length}`);
-    } catch (err) {
-      console.error('Failed to fetch coins list:', (err as any).message);
-      console.error('Falling back to markets endpoint...');
+      console.log(`Total coins to seed: ${coinsToProcess.length}`);
       
-      // Fallback to markets endpoint if /coins/list fails
+      // Process ALL coins directly from /coins/list response (single API call!)
+      // No need to call coinDetails() for each token - we have all the data we need
+      let seeded = 0;
+      let failed = 0;
+      
+      console.log('Processing coins directly from /coins/list response...');
+      
+      for (let i = 0; i < coinsToProcess.length; i++) {
+        const coin = coinsToProcess[i];
+        
+        try {
+          if (!coin.id || !coin.symbol) {
+            console.warn(`Skipping invalid coin at index ${i}`);
+            failed++;
+            continue;
+          }
+          
+          const symbol = (coin.symbol || '').toUpperCase();
+          const coinId = coin.id;
+          
+          // Extract contract addresses from platforms
+          let contractAddresses: Record<string, string> | null = null;
+          let smartContractAddress: string | null = null;
+          
+          if (coin.platforms && typeof coin.platforms === 'object') {
+            const filtered: Record<string, string> = {};
+            for (const [network, address] of Object.entries(coin.platforms)) {
+              const addressStr = typeof address === 'string' ? address : String(address);
+              if (addressStr && addressStr.trim() !== '' && addressStr !== 'null' && addressStr !== 'undefined') {
+                filtered[network] = addressStr;
+              }
+            }
+            contractAddresses = Object.keys(filtered).length > 0 ? filtered : null;
+            
+            // Extract smart_contract_address: prioritize common networks, then any available
+            if (contractAddresses.ethereum) {
+              smartContractAddress = contractAddresses.ethereum;
+            } else if (contractAddresses['ethereum-classic']) {
+              smartContractAddress = contractAddresses['ethereum-classic'];
+            } else if (contractAddresses.binance || contractAddresses['binance-smart-chain']) {
+              smartContractAddress = contractAddresses.binance || contractAddresses['binance-smart-chain'];
+            } else if (contractAddresses.polygon || contractAddresses['polygon-pos']) {
+              smartContractAddress = contractAddresses.polygon || contractAddresses['polygon-pos'];
+            } else if (contractAddresses.avalanche) {
+              smartContractAddress = contractAddresses.avalanche;
+            } else if (contractAddresses.core || contractAddresses['core-dao']) {
+              smartContractAddress = contractAddresses.core || contractAddresses['core-dao'];
+            } else {
+              // Fallback: use first available platform (any network)
+              const firstPlatform = Object.keys(contractAddresses)[0];
+              if (firstPlatform) {
+                smartContractAddress = contractAddresses[firstPlatform];
+              }
+            }
+          }
+          
+          // If no contract address found in /coins/list, try fetching coinDetails for important tokens
+          // This handles cases where /coins/list doesn't include platform data
+          if (!smartContractAddress && !contractAddresses) {
+            // For tokens that should have contract addresses (like CORE), fetch details
+            // But only for a small subset to avoid rate limits - use coinDetails for missing data
+            try {
+              const details = await cg.coinDetails(coinId);
+              
+              // Extract platforms from coinDetails
+              if (details.platforms && typeof details.platforms === 'object') {
+                const filtered: Record<string, string> = {};
+                for (const [network, address] of Object.entries(details.platforms)) {
+                  const addressStr = typeof address === 'string' ? address : String(address);
+                  if (addressStr && addressStr.trim() !== '' && addressStr !== 'null' && addressStr !== 'undefined') {
+                    filtered[network] = addressStr;
+                  }
+                }
+                if (Object.keys(filtered).length > 0) {
+                  contractAddresses = filtered;
+                  
+                  // Extract smart contract address
+                  if (filtered.ethereum) {
+                    smartContractAddress = filtered.ethereum;
+                  } else if (filtered['ethereum-classic']) {
+                    smartContractAddress = filtered['ethereum-classic'];
+                  } else if (filtered.binance || filtered['binance-smart-chain']) {
+                    smartContractAddress = filtered.binance || filtered['binance-smart-chain'];
+                  } else if (filtered.polygon || filtered['polygon-pos']) {
+                    smartContractAddress = filtered.polygon || filtered['polygon-pos'];
+                  } else if (filtered.avalanche) {
+                    smartContractAddress = filtered.avalanche;
+                  } else if (filtered.core || filtered['core-dao']) {
+                    smartContractAddress = filtered.core || filtered['core-dao'];
+                  } else {
+                    const firstPlatform = Object.keys(filtered)[0];
+                    if (firstPlatform) {
+                      smartContractAddress = filtered[firstPlatform];
+                    }
+                  }
+                  
+                }
+              }
+              
+              // Small delay to avoid rate limits when fetching coinDetails
+              await new Promise((res) => setTimeout(res, 100));
+            } catch (err) {
+              // Silently continue if coinDetails fails - we'll use what we have from /coins/list
+            }
+          }
+          
+          // Prepare metadata from /coins/list response
+          // Note: logo, image_url, description, etc. are not in /coins/list
+          // We'll set them to null and they can be updated later via coinDetails if needed
+          const meta = {
+            symbol,
+            coingecko_id: coinId,
+            name: coin.name || null,
+            logo: null, // Not available in /coins/list
+            image_url: null, // Not available in /coins/list
+            social_links: {
+              twitter: null, // Not available in /coins/list
+              homepage: null // Not available in /coins/list
+            },
+            about: null, // Not available in /coins/list
+            category: null, // Not available in /coins/list
+            smart_contract_address: smartContractAddress,
+            contract_address: contractAddresses,
+            categories: null // Not available in /coins/list
+          };
+          
+          await repo.upsert(meta as any, ['coingecko_id']);
+          seeded++;
+          
+          // Progress logging every 1000 coins
+          if ((i + 1) % 1000 === 0 || i + 1 === coinsToProcess.length) {
+            console.log(`Progress: ${i + 1}/${coinsToProcess.length} processed (${seeded} seeded, ${failed} failed)`);
+          }
+        } catch (err) {
+          console.error(`Failed to seed ${coin.id}:`, (err as any).message);
+          failed++;
+        }
+      }
+      
+      console.log(`\nSeed completed: ${seeded} tokens seeded, ${failed} failed`);
+      console.log(`\nNote: Basic token data (symbol, name, contract addresses) has been stored.`);
+      console.log(`To get additional metadata (logo, description, etc.), run the token metadata processor or update individual tokens.`);
+      
+      await ds.destroy();
+      process.exit(0);
+    } catch (err: any) {
+      const isRateLimit = err?.response?.status === 429;
+      const retryAfter = err?.response?.headers?.['retry-after'];
+      
+      if (isRateLimit) {
+        console.error('\n❌ Rate limit exceeded (429 Too Many Requests)');
+        console.error('CoinGecko API rate limit has been reached.');
+        if (retryAfter) {
+          const waitMinutes = Math.ceil(Number(retryAfter) / 60);
+          console.error(`\n⏳ Please wait ${retryAfter} seconds (${waitMinutes} minutes) before trying again.`);
+          console.error(`   Or wait a few minutes and run: npm run seed`);
+        } else {
+          console.error('\n⏳ Please wait 5-10 minutes before trying again.');
+          console.error('   CoinGecko free tier allows 5-15 calls per minute.');
+        }
+        console.error('\n💡 Tips to avoid rate limits:');
+        console.error('   1. Wait 5-10 minutes between seed runs');
+        console.error('   2. Use a CoinGecko API key for higher limits (30-50 calls/min)');
+        console.error('   3. Run seed script during off-peak hours');
+        console.error('\n');
+        await ds.destroy();
+        process.exit(1); // Exit early on rate limit - don't try fallback
+      } else {
+        console.error('Failed to fetch coins list:', err?.message || err);
+        console.error('Falling back to markets endpoint...');
+      }
+      
+      // Fallback to markets endpoint if /coins/list fails (only for non-rate-limit errors)
       const maxPages = Number(process.env.COINGECKO_MAX_PAGES || 5);
       const perPage = Number(process.env.PER_PAGE || 250);
       const allCoinIds = new Set<string>();
@@ -144,30 +322,28 @@ async function main() {
       
       coinIds = Array.from(allCoinIds);
       console.log(`Total coins to seed (fallback): ${coinIds.length}`);
-    }
-  }
-  
-  // Process each coin
-  let seeded = 0;
-  let failed = 0;
-  const delayBetweenRequests = Number(process.env.SEED_DELAY_MS || 2000); // Default 2 seconds between requests
-  
-  for (let i = 0; i < coinIds.length; i++) {
+      
+      // Fallback: Process coins using coinDetails (slower, but works if /coins/list fails)
+      let seeded = 0;
+      let failed = 0;
+      const delayBetweenRequests = Number(process.env.SEED_DELAY_MS || 2000);
+      
+      for (let i = 0; i < coinIds.length; i++) {
     const id = coinIds[i];
     let retries = 0;
     const maxRetries = 5;
     let success = false;
     
     while (retries < maxRetries && !success) {
-      try {
-        const details = await cg.coinDetails(id);
+    try {
+      const details = await cg.coinDetails(id);
         
         // Validate we got valid data
         if (!details || !details.id) {
           throw new Error(`Invalid response for ${id}: missing data`);
         }
         
-        const symbol = (details.symbol || '').toUpperCase();
+      const symbol = (details.symbol || '').toUpperCase();
         
         if (!symbol) {
           console.warn(`Skipping ${id}: no symbol found`);
@@ -175,27 +351,39 @@ async function main() {
           success = true; // Mark as processed (even though failed) to continue
           break;
         }
-        
-        // Process contract_addresses: store as JSON object with network as key
-        // Handle both contract_addresses (custom format) and platforms (standard CoinGecko format)
-        // Networks (like Solana) will have empty contract_addresses, tokens will have addresses per network
-        let contractAddresses: Record<string, string> | null = null;
+      
+      // Process contract_addresses: store as JSON object with network as key
+        // First try to get platforms from /coins/list response (faster, already fetched)
+      let contractAddresses: Record<string, string> | null = null;
         let smartContractAddress: string | null = null;
         
-        // Try contract_addresses first (if provided in custom format)
-        if (details.contract_addresses) {
+        const coinsWithPlatforms = (global as any).__coinsWithPlatforms as Map<string, any> | undefined;
+        const coinFromList = coinsWithPlatforms?.get(id);
+      
+        // Use platforms from /coins/list if available (more efficient)
+        if (coinFromList && coinFromList.platforms && typeof coinFromList.platforms === 'object') {
+        const filtered: Record<string, string> = {};
+          for (const [network, address] of Object.entries(coinFromList.platforms)) {
+          if (address && typeof address === 'string' && address.trim() !== '') {
+            filtered[network] = address;
+          }
+        }
+        contractAddresses = Object.keys(filtered).length > 0 ? filtered : null;
+      }
+        // Fallback to coinDetails platforms
+      else if (details.platforms && typeof details.platforms === 'object') {
+        const filtered: Record<string, string> = {};
+        for (const [network, address] of Object.entries(details.platforms)) {
+          if (address && typeof address === 'string' && address.trim() !== '') {
+            filtered[network] = address;
+          }
+        }
+        contractAddresses = Object.keys(filtered).length > 0 ? filtered : null;
+      }
+        // Also check contract_addresses field (if provided in custom format)
+        else if (details.contract_addresses) {
           const filtered: Record<string, string> = {};
           for (const [network, address] of Object.entries(details.contract_addresses)) {
-            if (address && typeof address === 'string' && address.trim() !== '') {
-              filtered[network] = address;
-            }
-          }
-          contractAddresses = Object.keys(filtered).length > 0 ? filtered : null;
-        }
-        // Fallback to platforms (standard CoinGecko API format)
-        else if (details.platforms && typeof details.platforms === 'object') {
-          const filtered: Record<string, string> = {};
-          for (const [network, address] of Object.entries(details.platforms)) {
             if (address && typeof address === 'string' && address.trim() !== '') {
               filtered[network] = address;
             }
@@ -213,11 +401,11 @@ async function main() {
           else if (contractAddresses['ethereum-classic']) {
             smartContractAddress = contractAddresses['ethereum-classic'];
           }
-          else if (contractAddresses.binance) {
-            smartContractAddress = contractAddresses.binance;
+          else if (contractAddresses.binance || contractAddresses['binance-smart-chain']) {
+            smartContractAddress = contractAddresses.binance || contractAddresses['binance-smart-chain'];
           }
-          else if (contractAddresses.polygon) {
-            smartContractAddress = contractAddresses.polygon;
+          else if (contractAddresses.polygon || contractAddresses['polygon-pos']) {
+            smartContractAddress = contractAddresses.polygon || contractAddresses['polygon-pos'];
           }
           else if (contractAddresses.avalanche) {
             smartContractAddress = contractAddresses.avalanche;
@@ -230,45 +418,28 @@ async function main() {
             }
           }
         }
-        // Also check platforms directly (in case contractAddresses wasn't populated)
-        else if (details.platforms && typeof details.platforms === 'object') {
-          // Prioritize Ethereum
-          if (details.platforms.ethereum) {
-            smartContractAddress = details.platforms.ethereum;
-          }
-          // Fallback to first available platform
-          else {
-            const platforms = Object.entries(details.platforms);
-            for (const [network, address] of platforms) {
-              if (address && typeof address === 'string' && address.trim() !== '') {
-                smartContractAddress = address;
-                break;
-              }
-            }
-          }
-        }
-        
-        // Process categories: store as JSON array
-        const categories = details.categories && Array.isArray(details.categories) && details.categories.length > 0
-          ? details.categories
-          : null;
-        
-        const meta = {
-          symbol,
-          coingecko_id: id,
-          name: details.name,
-          logo: details.image?.thumb || details.image?.small || null,
-          image_url: details.image?.large || null,
-          social_links: {
-            twitter: details.links?.twitter_screen_name ? `https://twitter.com/${details.links.twitter_screen_name}` : null,
-            homepage: details.links?.homepage?.[0] || null
-          },
-          about: details.description?.en || null,
-          category: details.categories && details.categories.length ? details.categories.join(',') : null,
+      
+      // Process categories: store as JSON array
+      const categories = details.categories && Array.isArray(details.categories) && details.categories.length > 0
+        ? details.categories
+        : null;
+      
+      const meta = {
+        symbol,
+        coingecko_id: id,
+        name: details.name,
+        logo: details.image?.thumb || details.image?.small || null,
+        image_url: details.image?.large || null,
+        social_links: {
+          twitter: details.links?.twitter_screen_name ? `https://twitter.com/${details.links.twitter_screen_name}` : null,
+          homepage: details.links?.homepage?.[0] || null
+        },
+        about: details.description?.en || null,
+        category: details.categories && details.categories.length ? details.categories.join(',') : null,
           smart_contract_address: smartContractAddress,
-          contract_address: contractAddresses,
-          categories: categories
-        };
+        contract_address: contractAddresses,
+        categories: categories
+      };
         await repo.upsert(meta as any, ['coingecko_id']); // Use coingecko_id as unique identifier
         seeded++;
         console.log(`[${i + 1}/${coinIds.length}] Seeded ${symbol} (${id})`);
@@ -310,10 +481,12 @@ async function main() {
     }
   }
   
-  console.log(`\nSeed completed: ${seeded} tokens seeded, ${failed} failed`);
+      console.log(`\nSeed completed: ${seeded} tokens seeded, ${failed} failed`);
 
   await ds.destroy();
   process.exit(0);
+    }
+  }
 }
 
 main().catch((e) => { console.error(e); process.exit(1); });

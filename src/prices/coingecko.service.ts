@@ -22,7 +22,9 @@ export class CoingeckoService {
   constructor() {
     this.axios = axios.create({
       baseURL: this.base,
-      timeout: 15000,
+      timeout: 60000, // Increased timeout for large responses (60 seconds)
+      maxContentLength: Infinity, // No limit on response size
+      maxBodyLength: Infinity, // No limit on request body size
       headers: {
         'User-Agent': 'Larvens-Prices-Service/1.0 (+https://your.company)',
         Accept: 'application/json',
@@ -31,17 +33,26 @@ export class CoingeckoService {
 
     // retry config: retry on 429, 500-504, or network errors
     axiosRetry(this.axios, {
-      retries: 3,
+      retries: 5, // Increased retries for rate limits
       retryDelay: (retryCount, error) => {
         // If server sent Retry-After header, respect it (seconds)
         const retryAfter = error?.response?.headers?.['retry-after'];
         if (retryAfter) {
           const wait = Number(retryAfter) * 1000;
-          this.logger.warn(`Retry-After header present, wait ${wait}ms`);
-          return wait;
+          // Add extra buffer time (10 seconds) to ensure we don't hit rate limit again
+          const waitWithBuffer = wait + 10000;
+          this.logger.warn(`Retry-After header present, wait ${waitWithBuffer}ms (${wait}ms + 10s buffer)`);
+          return waitWithBuffer;
         }
-        // exponential backoff base: 1000ms * 2^(retryCount-1)
-        const delay = 1000 * Math.pow(2, retryCount - 1);
+        // For 429 errors without Retry-After, wait longer (60 seconds)
+        const status = error?.response?.status;
+        if (status === 429) {
+          const delay = 60000; // Wait 60 seconds for rate limits
+          this.logger.warn(`Rate limit hit (429), waiting ${delay}ms before retry`);
+          return delay;
+        }
+        // exponential backoff base: 2000ms * 2^(retryCount-1)
+        const delay = 2000 * Math.pow(2, retryCount - 1);
         return delay;
       },
       shouldResetTimeout: true,
@@ -103,18 +114,29 @@ export class CoingeckoService {
   /**
    * Fetches the complete list of all supported cryptocurrencies from CoinGecko
    * Uses in-memory cache to avoid repeated slow API calls (cache for 1 hour)
-   * @returns Array of coin objects with id, symbol, and name
+   * @param includePlatform - Whether to include platform contract addresses (default: true)
+   * @returns Array of coin objects with id, symbol, name, and platforms (if includePlatform=true)
    */
-  async coinsList() {
+  async coinsList(includePlatform = true) {
     // Check cache first
+    const cacheKey = includePlatform ? 'with-platforms' : 'basic';
     if (this.coinsListCache && (Date.now() - this.coinsListCache.timestamp) < this.coinsListCacheTTL) {
       this.logger.debug('Returning coins list from cache');
       return this.coinsListCache.data;
     }
 
-    // Fetch from API
+    // Fetch from API with include_platform parameter to get contract addresses
     this.logger.debug('Fetching coins list from CoinGecko API (this may take a few seconds)');
-    const r = await this.axios.get('/coins/list');
+    const params: any = {};
+    if (includePlatform) {
+      params.include_platform = true;
+    }
+    const r = await this.axios.get('/coins/list', { 
+      params,
+      timeout: 60000, // 60 seconds for large responses
+      maxContentLength: Infinity,
+      maxBodyLength: Infinity,
+    });
     
     // Update cache
     this.coinsListCache = {
@@ -122,6 +144,18 @@ export class CoingeckoService {
       timestamp: Date.now(),
     };
     
+    return r.data;
+  }
+
+  /**
+   * Fetches token data from CoinGecko Asset API (/assets/token endpoint)
+   * This endpoint provides comprehensive token information including contract addresses
+   * @param network - Network name (e.g., 'ethereum', 'polygon-pos')
+   * @param address - Contract address
+   * @returns Token data with contract address and metadata
+   */
+  async assetToken(network: string, address: string) {
+    const r = await this.axios.get(`/networks/${encodeURIComponent(network)}/tokens/${encodeURIComponent(address)}`);
     return r.data;
   }
 }

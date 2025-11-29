@@ -34,17 +34,26 @@ export class TokenMetadataProcessor extends WorkerHost {
     this.logger.log(`Processing token metadata job ${job.id} of type ${job.name}`);
     
     try {
-      // Use /coins/list endpoint to get ALL coins (not just those with market data)
+      // Use /coins/list endpoint with include_platform=true to get ALL coins with contract addresses
       // This endpoint returns all coins in a single response without pagination
       let coinIds: string[] = [];
+      let coinsWithPlatforms: Map<string, any> | null = null;
       
       try {
-        const allCoins = await this.cg.coinsList();
-        this.logger.log(`Fetched ${allCoins.length} coins from CoinGecko /coins/list endpoint`);
+        const allCoins = await this.cg.coinsList(true); // include_platform=true to get contract addresses
+        this.logger.log(`Fetched ${allCoins.length} coins from CoinGecko /coins/list endpoint (with platforms)`);
         
         coinIds = allCoins
           .map((coin: any) => coin.id)
           .filter((id: string) => id && id.trim() !== '');
+        
+        // Store platforms data for efficient contract address extraction
+        coinsWithPlatforms = new Map<string, any>();
+        allCoins.forEach((coin: any) => {
+          if (coin.id && coin.platforms) {
+            coinsWithPlatforms!.set(coin.id, coin);
+          }
+        });
       } catch (err) {
         this.logger.error(`Failed to fetch coins list: ${(err as any).message}`);
         this.logger.log('Falling back to markets endpoint...');
@@ -94,24 +103,36 @@ export class TokenMetadataProcessor extends WorkerHost {
           }
           
           // Process contract_addresses: store as JSON object with network as key
-          // Same format as seed script for bitcoin, ethereum, solana
+          // First try to get platforms from /coins/list response (faster, already fetched)
           let contractAddresses: Record<string, string> | null = null;
           let smartContractAddress: string | null = null;
           
-          // Try contract_addresses first (if provided in custom format)
-          if (details.contract_addresses) {
+          const coinFromList = coinsWithPlatforms?.get(coinId);
+          
+          // Use platforms from /coins/list if available (more efficient - already fetched)
+          if (coinFromList && coinFromList.platforms && typeof coinFromList.platforms === 'object') {
             const filtered: Record<string, string> = {};
-            for (const [network, address] of Object.entries(details.contract_addresses)) {
+            for (const [network, address] of Object.entries(coinFromList.platforms)) {
               if (address && typeof address === 'string' && address.trim() !== '') {
                 filtered[network] = address;
               }
             }
             contractAddresses = Object.keys(filtered).length > 0 ? filtered : null;
           }
-          // Fallback to platforms (standard CoinGecko API format)
+          // Fallback to coinDetails platforms
           else if (details.platforms && typeof details.platforms === 'object') {
             const filtered: Record<string, string> = {};
             for (const [network, address] of Object.entries(details.platforms)) {
+              if (address && typeof address === 'string' && address.trim() !== '') {
+                filtered[network] = address;
+              }
+            }
+            contractAddresses = Object.keys(filtered).length > 0 ? filtered : null;
+          }
+          // Also check contract_addresses field (if provided in custom format)
+          else if (details.contract_addresses) {
+            const filtered: Record<string, string> = {};
+            for (const [network, address] of Object.entries(details.contract_addresses)) {
               if (address && typeof address === 'string' && address.trim() !== '') {
                 filtered[network] = address;
               }

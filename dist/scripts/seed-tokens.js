@@ -60,20 +60,172 @@ async function main() {
             console.log(`MAX_COINS limit set: ${maxCoins} coins`);
         }
         try {
-            const allCoins = await cg.coinsList();
-            console.log(`Fetched ${allCoins.length} coins from CoinGecko /coins/list endpoint`);
-            coinIds = allCoins
-                .map((coin) => coin.id)
-                .filter((id) => id && id.trim() !== '');
-            if (maxCoins && coinIds.length > maxCoins) {
-                coinIds = coinIds.slice(0, maxCoins);
+            console.log('Waiting 5 seconds before making API request to avoid rate limits...');
+            await new Promise((res) => setTimeout(res, 5000));
+            const allCoins = await cg.coinsList(true);
+            if (!Array.isArray(allCoins)) {
+                throw new Error(`Invalid response format: expected array, got ${typeof allCoins}`);
+            }
+            console.log(`Fetched ${allCoins.length} coins from CoinGecko /coins/list endpoint (with platforms)`);
+            let coinsToProcess = allCoins;
+            if (maxCoins && allCoins.length > maxCoins) {
+                coinsToProcess = allCoins.slice(0, maxCoins);
                 console.log(`Limited to ${maxCoins} coins (MAX_COINS limit)`);
             }
-            console.log(`Total coins to seed: ${coinIds.length}`);
+            console.log(`Total coins to seed: ${coinsToProcess.length}`);
+            let seeded = 0;
+            let failed = 0;
+            console.log('Processing coins directly from /coins/list response...');
+            for (let i = 0; i < coinsToProcess.length; i++) {
+                const coin = coinsToProcess[i];
+                try {
+                    if (!coin.id || !coin.symbol) {
+                        console.warn(`Skipping invalid coin at index ${i}`);
+                        failed++;
+                        continue;
+                    }
+                    const symbol = (coin.symbol || '').toUpperCase();
+                    const coinId = coin.id;
+                    let contractAddresses = null;
+                    let smartContractAddress = null;
+                    if (coin.platforms && typeof coin.platforms === 'object') {
+                        const filtered = {};
+                        for (const [network, address] of Object.entries(coin.platforms)) {
+                            const addressStr = typeof address === 'string' ? address : String(address);
+                            if (addressStr && addressStr.trim() !== '' && addressStr !== 'null' && addressStr !== 'undefined') {
+                                filtered[network] = addressStr;
+                            }
+                        }
+                        contractAddresses = Object.keys(filtered).length > 0 ? filtered : null;
+                        if (contractAddresses.ethereum) {
+                            smartContractAddress = contractAddresses.ethereum;
+                        }
+                        else if (contractAddresses['ethereum-classic']) {
+                            smartContractAddress = contractAddresses['ethereum-classic'];
+                        }
+                        else if (contractAddresses.binance || contractAddresses['binance-smart-chain']) {
+                            smartContractAddress = contractAddresses.binance || contractAddresses['binance-smart-chain'];
+                        }
+                        else if (contractAddresses.polygon || contractAddresses['polygon-pos']) {
+                            smartContractAddress = contractAddresses.polygon || contractAddresses['polygon-pos'];
+                        }
+                        else if (contractAddresses.avalanche) {
+                            smartContractAddress = contractAddresses.avalanche;
+                        }
+                        else if (contractAddresses.core || contractAddresses['core-dao']) {
+                            smartContractAddress = contractAddresses.core || contractAddresses['core-dao'];
+                        }
+                        else {
+                            const firstPlatform = Object.keys(contractAddresses)[0];
+                            if (firstPlatform) {
+                                smartContractAddress = contractAddresses[firstPlatform];
+                            }
+                        }
+                    }
+                    if (!smartContractAddress && !contractAddresses) {
+                        try {
+                            const details = await cg.coinDetails(coinId);
+                            if (details.platforms && typeof details.platforms === 'object') {
+                                const filtered = {};
+                                for (const [network, address] of Object.entries(details.platforms)) {
+                                    const addressStr = typeof address === 'string' ? address : String(address);
+                                    if (addressStr && addressStr.trim() !== '' && addressStr !== 'null' && addressStr !== 'undefined') {
+                                        filtered[network] = addressStr;
+                                    }
+                                }
+                                if (Object.keys(filtered).length > 0) {
+                                    contractAddresses = filtered;
+                                    if (filtered.ethereum) {
+                                        smartContractAddress = filtered.ethereum;
+                                    }
+                                    else if (filtered['ethereum-classic']) {
+                                        smartContractAddress = filtered['ethereum-classic'];
+                                    }
+                                    else if (filtered.binance || filtered['binance-smart-chain']) {
+                                        smartContractAddress = filtered.binance || filtered['binance-smart-chain'];
+                                    }
+                                    else if (filtered.polygon || filtered['polygon-pos']) {
+                                        smartContractAddress = filtered.polygon || filtered['polygon-pos'];
+                                    }
+                                    else if (filtered.avalanche) {
+                                        smartContractAddress = filtered.avalanche;
+                                    }
+                                    else if (filtered.core || filtered['core-dao']) {
+                                        smartContractAddress = filtered.core || filtered['core-dao'];
+                                    }
+                                    else {
+                                        const firstPlatform = Object.keys(filtered)[0];
+                                        if (firstPlatform) {
+                                            smartContractAddress = filtered[firstPlatform];
+                                        }
+                                    }
+                                }
+                            }
+                            await new Promise((res) => setTimeout(res, 100));
+                        }
+                        catch (err) {
+                        }
+                    }
+                    const meta = {
+                        symbol,
+                        coingecko_id: coinId,
+                        name: coin.name || null,
+                        logo: null,
+                        image_url: null,
+                        social_links: {
+                            twitter: null,
+                            homepage: null
+                        },
+                        about: null,
+                        category: null,
+                        smart_contract_address: smartContractAddress,
+                        contract_address: contractAddresses,
+                        categories: null
+                    };
+                    await repo.upsert(meta, ['coingecko_id']);
+                    seeded++;
+                    if ((i + 1) % 1000 === 0 || i + 1 === coinsToProcess.length) {
+                        console.log(`Progress: ${i + 1}/${coinsToProcess.length} processed (${seeded} seeded, ${failed} failed)`);
+                    }
+                }
+                catch (err) {
+                    console.error(`Failed to seed ${coin.id}:`, err.message);
+                    failed++;
+                }
+            }
+            console.log(`\nSeed completed: ${seeded} tokens seeded, ${failed} failed`);
+            console.log(`\nNote: Basic token data (symbol, name, contract addresses) has been stored.`);
+            console.log(`To get additional metadata (logo, description, etc.), run the token metadata processor or update individual tokens.`);
+            await ds.destroy();
+            process.exit(0);
         }
         catch (err) {
-            console.error('Failed to fetch coins list:', err.message);
-            console.error('Falling back to markets endpoint...');
+            const isRateLimit = err?.response?.status === 429;
+            const retryAfter = err?.response?.headers?.['retry-after'];
+            if (isRateLimit) {
+                console.error('\n❌ Rate limit exceeded (429 Too Many Requests)');
+                console.error('CoinGecko API rate limit has been reached.');
+                if (retryAfter) {
+                    const waitMinutes = Math.ceil(Number(retryAfter) / 60);
+                    console.error(`\n⏳ Please wait ${retryAfter} seconds (${waitMinutes} minutes) before trying again.`);
+                    console.error(`   Or wait a few minutes and run: npm run seed`);
+                }
+                else {
+                    console.error('\n⏳ Please wait 5-10 minutes before trying again.');
+                    console.error('   CoinGecko free tier allows 5-15 calls per minute.');
+                }
+                console.error('\n💡 Tips to avoid rate limits:');
+                console.error('   1. Wait 5-10 minutes between seed runs');
+                console.error('   2. Use a CoinGecko API key for higher limits (30-50 calls/min)');
+                console.error('   3. Run seed script during off-peak hours');
+                console.error('\n');
+                await ds.destroy();
+                process.exit(1);
+            }
+            else {
+                console.error('Failed to fetch coins list:', err?.message || err);
+                console.error('Falling back to markets endpoint...');
+            }
             const maxPages = Number(process.env.COINGECKO_MAX_PAGES || 5);
             const perPage = Number(process.env.PER_PAGE || 250);
             const allCoinIds = new Set();
@@ -104,143 +256,140 @@ async function main() {
             }
             coinIds = Array.from(allCoinIds);
             console.log(`Total coins to seed (fallback): ${coinIds.length}`);
-        }
-    }
-    let seeded = 0;
-    let failed = 0;
-    const delayBetweenRequests = Number(process.env.SEED_DELAY_MS || 2000);
-    for (let i = 0; i < coinIds.length; i++) {
-        const id = coinIds[i];
-        let retries = 0;
-        const maxRetries = 5;
-        let success = false;
-        while (retries < maxRetries && !success) {
-            try {
-                const details = await cg.coinDetails(id);
-                if (!details || !details.id) {
-                    throw new Error(`Invalid response for ${id}: missing data`);
-                }
-                const symbol = (details.symbol || '').toUpperCase();
-                if (!symbol) {
-                    console.warn(`Skipping ${id}: no symbol found`);
-                    failed++;
-                    success = true;
-                    break;
-                }
-                let contractAddresses = null;
-                let smartContractAddress = null;
-                if (details.contract_addresses) {
-                    const filtered = {};
-                    for (const [network, address] of Object.entries(details.contract_addresses)) {
-                        if (address && typeof address === 'string' && address.trim() !== '') {
-                            filtered[network] = address;
+            let seeded = 0;
+            let failed = 0;
+            const delayBetweenRequests = Number(process.env.SEED_DELAY_MS || 2000);
+            for (let i = 0; i < coinIds.length; i++) {
+                const id = coinIds[i];
+                let retries = 0;
+                const maxRetries = 5;
+                let success = false;
+                while (retries < maxRetries && !success) {
+                    try {
+                        const details = await cg.coinDetails(id);
+                        if (!details || !details.id) {
+                            throw new Error(`Invalid response for ${id}: missing data`);
                         }
-                    }
-                    contractAddresses = Object.keys(filtered).length > 0 ? filtered : null;
-                }
-                else if (details.platforms && typeof details.platforms === 'object') {
-                    const filtered = {};
-                    for (const [network, address] of Object.entries(details.platforms)) {
-                        if (address && typeof address === 'string' && address.trim() !== '') {
-                            filtered[network] = address;
+                        const symbol = (details.symbol || '').toUpperCase();
+                        if (!symbol) {
+                            console.warn(`Skipping ${id}: no symbol found`);
+                            failed++;
+                            success = true;
+                            break;
                         }
-                    }
-                    contractAddresses = Object.keys(filtered).length > 0 ? filtered : null;
-                }
-                if (contractAddresses) {
-                    if (contractAddresses.ethereum) {
-                        smartContractAddress = contractAddresses.ethereum;
-                    }
-                    else if (contractAddresses['ethereum-classic']) {
-                        smartContractAddress = contractAddresses['ethereum-classic'];
-                    }
-                    else if (contractAddresses.binance) {
-                        smartContractAddress = contractAddresses.binance;
-                    }
-                    else if (contractAddresses.polygon) {
-                        smartContractAddress = contractAddresses.polygon;
-                    }
-                    else if (contractAddresses.avalanche) {
-                        smartContractAddress = contractAddresses.avalanche;
-                    }
-                    else {
-                        const firstPlatform = Object.keys(contractAddresses)[0];
-                        if (firstPlatform) {
-                            smartContractAddress = contractAddresses[firstPlatform];
+                        let contractAddresses = null;
+                        let smartContractAddress = null;
+                        const coinsWithPlatforms = global.__coinsWithPlatforms;
+                        const coinFromList = coinsWithPlatforms?.get(id);
+                        if (coinFromList && coinFromList.platforms && typeof coinFromList.platforms === 'object') {
+                            const filtered = {};
+                            for (const [network, address] of Object.entries(coinFromList.platforms)) {
+                                if (address && typeof address === 'string' && address.trim() !== '') {
+                                    filtered[network] = address;
+                                }
+                            }
+                            contractAddresses = Object.keys(filtered).length > 0 ? filtered : null;
                         }
-                    }
-                }
-                else if (details.platforms && typeof details.platforms === 'object') {
-                    if (details.platforms.ethereum) {
-                        smartContractAddress = details.platforms.ethereum;
-                    }
-                    else {
-                        const platforms = Object.entries(details.platforms);
-                        for (const [network, address] of platforms) {
-                            if (address && typeof address === 'string' && address.trim() !== '') {
-                                smartContractAddress = address;
-                                break;
+                        else if (details.platforms && typeof details.platforms === 'object') {
+                            const filtered = {};
+                            for (const [network, address] of Object.entries(details.platforms)) {
+                                if (address && typeof address === 'string' && address.trim() !== '') {
+                                    filtered[network] = address;
+                                }
+                            }
+                            contractAddresses = Object.keys(filtered).length > 0 ? filtered : null;
+                        }
+                        else if (details.contract_addresses) {
+                            const filtered = {};
+                            for (const [network, address] of Object.entries(details.contract_addresses)) {
+                                if (address && typeof address === 'string' && address.trim() !== '') {
+                                    filtered[network] = address;
+                                }
+                            }
+                            contractAddresses = Object.keys(filtered).length > 0 ? filtered : null;
+                        }
+                        if (contractAddresses) {
+                            if (contractAddresses.ethereum) {
+                                smartContractAddress = contractAddresses.ethereum;
+                            }
+                            else if (contractAddresses['ethereum-classic']) {
+                                smartContractAddress = contractAddresses['ethereum-classic'];
+                            }
+                            else if (contractAddresses.binance || contractAddresses['binance-smart-chain']) {
+                                smartContractAddress = contractAddresses.binance || contractAddresses['binance-smart-chain'];
+                            }
+                            else if (contractAddresses.polygon || contractAddresses['polygon-pos']) {
+                                smartContractAddress = contractAddresses.polygon || contractAddresses['polygon-pos'];
+                            }
+                            else if (contractAddresses.avalanche) {
+                                smartContractAddress = contractAddresses.avalanche;
+                            }
+                            else {
+                                const firstPlatform = Object.keys(contractAddresses)[0];
+                                if (firstPlatform) {
+                                    smartContractAddress = contractAddresses[firstPlatform];
+                                }
                             }
                         }
+                        const categories = details.categories && Array.isArray(details.categories) && details.categories.length > 0
+                            ? details.categories
+                            : null;
+                        const meta = {
+                            symbol,
+                            coingecko_id: id,
+                            name: details.name,
+                            logo: details.image?.thumb || details.image?.small || null,
+                            image_url: details.image?.large || null,
+                            social_links: {
+                                twitter: details.links?.twitter_screen_name ? `https://twitter.com/${details.links.twitter_screen_name}` : null,
+                                homepage: details.links?.homepage?.[0] || null
+                            },
+                            about: details.description?.en || null,
+                            category: details.categories && details.categories.length ? details.categories.join(',') : null,
+                            smart_contract_address: smartContractAddress,
+                            contract_address: contractAddresses,
+                            categories: categories
+                        };
+                        await repo.upsert(meta, ['coingecko_id']);
+                        seeded++;
+                        console.log(`[${i + 1}/${coinIds.length}] Seeded ${symbol} (${id})`);
+                        success = true;
+                        if ((i + 1) % 10 === 0 || i + 1 === coinIds.length) {
+                            console.log(`Progress: ${i + 1}/${coinIds.length} processed (${seeded} seeded, ${failed} failed)`);
+                        }
+                        break;
+                    }
+                    catch (err) {
+                        retries++;
+                        const isRateLimit = err?.response?.status === 429;
+                        const retryAfter = err?.response?.headers?.['retry-after'];
+                        if (isRateLimit && retryAfter) {
+                            const waitTime = Number(retryAfter) * 1000;
+                            console.warn(`Rate limit hit for ${id}. Waiting ${waitTime}ms (Retry-After: ${retryAfter}s)`);
+                            await new Promise((res) => setTimeout(res, waitTime));
+                            retries--;
+                        }
+                        else if (retries >= maxRetries) {
+                            console.error(`Failed to seed ${id} after ${maxRetries} attempts:`, err?.message || err);
+                            failed++;
+                            success = true;
+                        }
+                        else {
+                            const waitTime = Math.min(1000 * Math.pow(2, retries - 1), 30000);
+                            console.warn(`Error seeding ${id} (attempt ${retries}/${maxRetries}): ${err?.message || err}. Retrying in ${waitTime}ms...`);
+                            await new Promise((res) => setTimeout(res, waitTime));
+                        }
                     }
                 }
-                const categories = details.categories && Array.isArray(details.categories) && details.categories.length > 0
-                    ? details.categories
-                    : null;
-                const meta = {
-                    symbol,
-                    coingecko_id: id,
-                    name: details.name,
-                    logo: details.image?.thumb || details.image?.small || null,
-                    image_url: details.image?.large || null,
-                    social_links: {
-                        twitter: details.links?.twitter_screen_name ? `https://twitter.com/${details.links.twitter_screen_name}` : null,
-                        homepage: details.links?.homepage?.[0] || null
-                    },
-                    about: details.description?.en || null,
-                    category: details.categories && details.categories.length ? details.categories.join(',') : null,
-                    smart_contract_address: smartContractAddress,
-                    contract_address: contractAddresses,
-                    categories: categories
-                };
-                await repo.upsert(meta, ['coingecko_id']);
-                seeded++;
-                console.log(`[${i + 1}/${coinIds.length}] Seeded ${symbol} (${id})`);
-                success = true;
-                if ((i + 1) % 10 === 0 || i + 1 === coinIds.length) {
-                    console.log(`Progress: ${i + 1}/${coinIds.length} processed (${seeded} seeded, ${failed} failed)`);
-                }
-                break;
-            }
-            catch (err) {
-                retries++;
-                const isRateLimit = err?.response?.status === 429;
-                const retryAfter = err?.response?.headers?.['retry-after'];
-                if (isRateLimit && retryAfter) {
-                    const waitTime = Number(retryAfter) * 1000;
-                    console.warn(`Rate limit hit for ${id}. Waiting ${waitTime}ms (Retry-After: ${retryAfter}s)`);
-                    await new Promise((res) => setTimeout(res, waitTime));
-                    retries--;
-                }
-                else if (retries >= maxRetries) {
-                    console.error(`Failed to seed ${id} after ${maxRetries} attempts:`, err?.message || err);
-                    failed++;
-                    success = true;
-                }
-                else {
-                    const waitTime = Math.min(1000 * Math.pow(2, retries - 1), 30000);
-                    console.warn(`Error seeding ${id} (attempt ${retries}/${maxRetries}): ${err?.message || err}. Retrying in ${waitTime}ms...`);
-                    await new Promise((res) => setTimeout(res, waitTime));
+                if (i < coinIds.length - 1) {
+                    await new Promise((res) => setTimeout(res, delayBetweenRequests));
                 }
             }
-        }
-        if (i < coinIds.length - 1) {
-            await new Promise((res) => setTimeout(res, delayBetweenRequests));
+            console.log(`\nSeed completed: ${seeded} tokens seeded, ${failed} failed`);
+            await ds.destroy();
+            process.exit(0);
         }
     }
-    console.log(`\nSeed completed: ${seeded} tokens seeded, ${failed} failed`);
-    await ds.destroy();
-    process.exit(0);
 }
 main().catch((e) => { console.error(e); process.exit(1); });
 //# sourceMappingURL=seed-tokens.js.map

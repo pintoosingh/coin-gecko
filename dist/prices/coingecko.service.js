@@ -24,22 +24,31 @@ let CoingeckoService = CoingeckoService_1 = class CoingeckoService {
         this.coinsListCacheTTL = 60 * 60 * 1000;
         this.axios = axios_1.default.create({
             baseURL: this.base,
-            timeout: 15000,
+            timeout: 60000,
+            maxContentLength: Infinity,
+            maxBodyLength: Infinity,
             headers: {
                 'User-Agent': 'Larvens-Prices-Service/1.0 (+https://your.company)',
                 Accept: 'application/json',
             },
         });
         (0, axios_retry_1.default)(this.axios, {
-            retries: 3,
+            retries: 5,
             retryDelay: (retryCount, error) => {
                 const retryAfter = error?.response?.headers?.['retry-after'];
                 if (retryAfter) {
                     const wait = Number(retryAfter) * 1000;
-                    this.logger.warn(`Retry-After header present, wait ${wait}ms`);
-                    return wait;
+                    const waitWithBuffer = wait + 10000;
+                    this.logger.warn(`Retry-After header present, wait ${waitWithBuffer}ms (${wait}ms + 10s buffer)`);
+                    return waitWithBuffer;
                 }
-                const delay = 1000 * Math.pow(2, retryCount - 1);
+                const status = error?.response?.status;
+                if (status === 429) {
+                    const delay = 60000;
+                    this.logger.warn(`Rate limit hit (429), waiting ${delay}ms before retry`);
+                    return delay;
+                }
+                const delay = 2000 * Math.pow(2, retryCount - 1);
                 return delay;
             },
             shouldResetTimeout: true,
@@ -82,17 +91,31 @@ let CoingeckoService = CoingeckoService_1 = class CoingeckoService {
         const r = await this.axios.get(`/coins/${encodeURIComponent(id)}`, { params });
         return r.data;
     }
-    async coinsList() {
+    async coinsList(includePlatform = true) {
+        const cacheKey = includePlatform ? 'with-platforms' : 'basic';
         if (this.coinsListCache && (Date.now() - this.coinsListCache.timestamp) < this.coinsListCacheTTL) {
             this.logger.debug('Returning coins list from cache');
             return this.coinsListCache.data;
         }
         this.logger.debug('Fetching coins list from CoinGecko API (this may take a few seconds)');
-        const r = await this.axios.get('/coins/list');
+        const params = {};
+        if (includePlatform) {
+            params.include_platform = true;
+        }
+        const r = await this.axios.get('/coins/list', {
+            params,
+            timeout: 60000,
+            maxContentLength: Infinity,
+            maxBodyLength: Infinity,
+        });
         this.coinsListCache = {
             data: r.data,
             timestamp: Date.now(),
         };
+        return r.data;
+    }
+    async assetToken(network, address) {
+        const r = await this.axios.get(`/networks/${encodeURIComponent(network)}/tokens/${encodeURIComponent(address)}`);
         return r.data;
     }
 };

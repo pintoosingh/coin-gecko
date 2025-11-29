@@ -34,32 +34,47 @@ export class TokenMetadataProcessor extends WorkerHost {
     this.logger.log(`Processing token metadata job ${job.id} of type ${job.name}`);
     
     try {
-      const maxPages = Number(process.env.COINGECKO_MAX_PAGES || 5);
-      const allCoinIds = new Set<string>();
+      // Use /coins/list endpoint to get ALL coins (not just those with market data)
+      // This endpoint returns all coins in a single response without pagination
+      let coinIds: string[] = [];
+      
+      try {
+        const allCoins = await this.cg.coinsList();
+        this.logger.log(`Fetched ${allCoins.length} coins from CoinGecko /coins/list endpoint`);
+        
+        coinIds = allCoins
+          .map((coin: any) => coin.id)
+          .filter((id: string) => id && id.trim() !== '');
+      } catch (err) {
+        this.logger.error(`Failed to fetch coins list: ${(err as any).message}`);
+        this.logger.log('Falling back to markets endpoint...');
+        
+        // Fallback to markets endpoint if /coins/list fails
+        const maxPages = Number(process.env.COINGECKO_MAX_PAGES || 5);
+        const allCoinIds = new Set<string>();
 
-      // Fetch all coin IDs from markets
-      for (let page = 1; page <= maxPages; page++) {
-        try {
-          const markets = await this.cg.coinsMarkets(page);
-          if (!markets || markets.length === 0) break;
-          
-          for (const market of markets) {
-            if (market.id) {
-              allCoinIds.add(market.id);
+        for (let page = 1; page <= maxPages; page++) {
+          try {
+            const markets = await this.cg.coinsMarkets(page);
+            if (!markets || markets.length === 0) break;
+            
+            for (const market of markets) {
+              if (market.id) {
+                allCoinIds.add(market.id);
+              }
             }
+            
+            await new Promise((res) => setTimeout(res, 200));
+            
+            if (markets.length < Number(process.env.PER_PAGE || 250)) break;
+          } catch (err2) {
+            this.logger.error(`Failed to fetch page ${page}: ${(err2 as any).message}`);
+            break;
           }
-          
-          // Gentle pause to avoid rate limits
-          await new Promise((res) => setTimeout(res, 200));
-          
-          if (markets.length < Number(process.env.PER_PAGE || 250)) break;
-        } catch (err) {
-          this.logger.error(`Failed to fetch page ${page}: ${(err as any).message}`);
-          break;
         }
-      }
 
-      const coinIds = Array.from(allCoinIds);
+        coinIds = Array.from(allCoinIds);
+      }
       this.logger.log(`Found ${coinIds.length} coins to process for metadata`);
 
       // Process each coin and store metadata
@@ -81,6 +96,7 @@ export class TokenMetadataProcessor extends WorkerHost {
           // Process contract_addresses: store as JSON object with network as key
           // Same format as seed script for bitcoin, ethereum, solana
           let contractAddresses: Record<string, string> | null = null;
+          let smartContractAddress: string | null = null;
           
           // Try contract_addresses first (if provided in custom format)
           if (details.contract_addresses) {
@@ -103,6 +119,51 @@ export class TokenMetadataProcessor extends WorkerHost {
             contractAddresses = Object.keys(filtered).length > 0 ? filtered : null;
           }
           
+          // Extract smart_contract_address: prioritize Ethereum, then first available platform
+          if (contractAddresses) {
+            // First try Ethereum (most common)
+            if (contractAddresses.ethereum) {
+              smartContractAddress = contractAddresses.ethereum;
+            }
+            // Then try other common networks
+            else if (contractAddresses['ethereum-classic']) {
+              smartContractAddress = contractAddresses['ethereum-classic'];
+            }
+            else if (contractAddresses.binance) {
+              smartContractAddress = contractAddresses.binance;
+            }
+            else if (contractAddresses.polygon) {
+              smartContractAddress = contractAddresses.polygon;
+            }
+            else if (contractAddresses.avalanche) {
+              smartContractAddress = contractAddresses.avalanche;
+            }
+            // Fallback to first available platform
+            else {
+              const firstPlatform = Object.keys(contractAddresses)[0];
+              if (firstPlatform) {
+                smartContractAddress = contractAddresses[firstPlatform];
+              }
+            }
+          }
+          // Also check platforms directly (in case contractAddresses wasn't populated)
+          else if (details.platforms && typeof details.platforms === 'object') {
+            // Prioritize Ethereum
+            if (details.platforms.ethereum) {
+              smartContractAddress = details.platforms.ethereum;
+            }
+            // Fallback to first available platform
+            else {
+              const platforms = Object.entries(details.platforms);
+              for (const [network, address] of platforms) {
+                if (address && typeof address === 'string' && address.trim() !== '') {
+                  smartContractAddress = address;
+                  break;
+                }
+              }
+            }
+          }
+          
           // Process categories: store as JSON array
           const categories = details.categories && Array.isArray(details.categories) && details.categories.length > 0
             ? details.categories
@@ -120,7 +181,7 @@ export class TokenMetadataProcessor extends WorkerHost {
             },
             about: details.description?.en || null,
             category: details.categories && details.categories.length ? details.categories.join(',') : null,
-            smart_contract_address: (details.platforms && details.platforms.ethereum) ? details.platforms.ethereum : null,
+            smart_contract_address: smartContractAddress,
             contract_address: contractAddresses,
             categories: categories
           };

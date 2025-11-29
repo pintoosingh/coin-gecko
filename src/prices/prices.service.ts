@@ -394,15 +394,32 @@ export class PricesService implements OnModuleInit, OnModuleDestroy {
         // When multiple tokens share the same symbol, prioritize by market cap (markets are sorted by market cap desc)
         if (!found) {
           for (let page = 1; page <= searchPages; page++) {
-            const markets = await this.cg.coinsMarkets(page);
-            // Find all matches and pick the one with highest market cap (first in sorted list)
-            found = markets.find((m) => m.symbol && m.symbol.toLowerCase() === symbol.toLowerCase());
-            if (found) {
-              liveData = found;
-              coinId = found.id; // Get coin ID from market data
-              break;
+            try {
+              const markets = await this.cg.coinsMarkets(page);
+              // Find all matches and pick the one with highest market cap (first in sorted list)
+              found = markets.find((m) => m.symbol && m.symbol.toLowerCase() === symbol.toLowerCase());
+              if (found) {
+                liveData = found;
+                coinId = found.id; // Get coin ID from market data
+                break;
+              }
+              if (!markets || markets.length === 0) break;
+            } catch (err: any) {
+              // Handle rate limit errors gracefully
+              if (err?.response?.status === 429) {
+                const retryAfter = err?.response?.headers?.['retry-after'];
+                const waitTime = retryAfter ? Number(retryAfter) * 1000 : 60000;
+                this.logger.warn(`Rate limit hit while searching markets (page ${page}). CoinGecko API limit reached. Please try again later.`);
+                // Don't throw - return null to indicate token not found due to rate limit
+                break;
+              }
+              // For other errors, log and continue to next page
+              this.logger.warn(`Failed to fetch markets page ${page}: ${err?.message || err}`);
+              // Continue to next page or break if it's a critical error
+              if (err?.response?.status >= 500) {
+                break; // Server error, stop searching
+              }
             }
-            if (!markets || markets.length === 0) break;
           }
         }
 
@@ -456,19 +473,32 @@ export class PricesService implements OnModuleInit, OnModuleDestroy {
 
               // If not in cache and not in database, fetch from API (only if needed)
               if (!coinDetailsData) {
-                // If we found it in markets, we already have live data, so just fetch static fields
-                // If we didn't find it, fetch full details including market data
-                coinDetailsData = await this.cg.coinDetails(coinId, !found);
-                
-                // Cache coin details for 1 hour (static data doesn't change often)
                 try {
-                  const client = this.ensureRedis();
-                  if (client) {
-                    const detailsKey = this.coinDetailsKey(coinId);
-                    await client.set(detailsKey, JSON.stringify(coinDetailsData), 'EX', 3600); // 1 hour cache
+                  // If we found it in markets, we already have live data, so just fetch static fields
+                  // If we didn't find it, fetch full details including market data
+                  coinDetailsData = await this.cg.coinDetails(coinId, !found);
+                  
+                  // Cache coin details for 1 hour (static data doesn't change often)
+                  try {
+                    const client = this.ensureRedis();
+                    if (client) {
+                      const detailsKey = this.coinDetailsKey(coinId);
+                      await client.set(detailsKey, JSON.stringify(coinDetailsData), 'EX', 3600); // 1 hour cache
+                    }
+                  } catch (err) {
+                    this.logger.debug('Failed to cache coin details');
                   }
-                } catch (err) {
-                  this.logger.debug('Failed to cache coin details');
+                } catch (err: any) {
+                  // Handle rate limit errors gracefully
+                  if (err?.response?.status === 429) {
+                    const retryAfter = err?.response?.headers?.['retry-after'];
+                    this.logger.warn(`Rate limit hit while fetching coin details for ${coinId}. CoinGecko API limit reached. Please try again later.`);
+                    // Continue without coin details - we'll use what we have
+                    coinDetailsData = null;
+                  } else {
+                    this.logger.warn(`Failed to fetch coin details for ${coinId}: ${err?.message || err}`);
+                    coinDetailsData = null;
+                  }
                 }
               }
             }
@@ -523,7 +553,14 @@ export class PricesService implements OnModuleInit, OnModuleDestroy {
             this.logger.debug('Failed to cache fallback market: ' + (err as any).message);
           }
         }
-      } catch (err) {
+      } catch (err: any) {
+        // Don't re-throw rate limit errors - return null instead
+        if (err?.response?.status === 429) {
+          const retryAfter = err?.response?.headers?.['retry-after'];
+          this.logger.warn(`Rate limit hit in fallback fetch. CoinGecko API limit reached. Retry-After: ${retryAfter || 'unknown'} seconds`);
+          // Return null to indicate token not found due to rate limit
+          return null;
+        }
         this.logger.error('fallback fetch failed', err);
         throw err;
       }

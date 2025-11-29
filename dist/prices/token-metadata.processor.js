@@ -30,28 +30,40 @@ let TokenMetadataProcessor = TokenMetadataProcessor_1 = class TokenMetadataProce
     async process(job) {
         this.logger.log(`Processing token metadata job ${job.id} of type ${job.name}`);
         try {
-            const maxPages = Number(process.env.COINGECKO_MAX_PAGES || 5);
-            const allCoinIds = new Set();
-            for (let page = 1; page <= maxPages; page++) {
-                try {
-                    const markets = await this.cg.coinsMarkets(page);
-                    if (!markets || markets.length === 0)
-                        break;
-                    for (const market of markets) {
-                        if (market.id) {
-                            allCoinIds.add(market.id);
-                        }
-                    }
-                    await new Promise((res) => setTimeout(res, 200));
-                    if (markets.length < Number(process.env.PER_PAGE || 250))
-                        break;
-                }
-                catch (err) {
-                    this.logger.error(`Failed to fetch page ${page}: ${err.message}`);
-                    break;
-                }
+            let coinIds = [];
+            try {
+                const allCoins = await this.cg.coinsList();
+                this.logger.log(`Fetched ${allCoins.length} coins from CoinGecko /coins/list endpoint`);
+                coinIds = allCoins
+                    .map((coin) => coin.id)
+                    .filter((id) => id && id.trim() !== '');
             }
-            const coinIds = Array.from(allCoinIds);
+            catch (err) {
+                this.logger.error(`Failed to fetch coins list: ${err.message}`);
+                this.logger.log('Falling back to markets endpoint...');
+                const maxPages = Number(process.env.COINGECKO_MAX_PAGES || 5);
+                const allCoinIds = new Set();
+                for (let page = 1; page <= maxPages; page++) {
+                    try {
+                        const markets = await this.cg.coinsMarkets(page);
+                        if (!markets || markets.length === 0)
+                            break;
+                        for (const market of markets) {
+                            if (market.id) {
+                                allCoinIds.add(market.id);
+                            }
+                        }
+                        await new Promise((res) => setTimeout(res, 200));
+                        if (markets.length < Number(process.env.PER_PAGE || 250))
+                            break;
+                    }
+                    catch (err2) {
+                        this.logger.error(`Failed to fetch page ${page}: ${err2.message}`);
+                        break;
+                    }
+                }
+                coinIds = Array.from(allCoinIds);
+            }
             this.logger.log(`Found ${coinIds.length} coins to process for metadata`);
             let saved = 0;
             let failed = 0;
@@ -66,6 +78,7 @@ let TokenMetadataProcessor = TokenMetadataProcessor_1 = class TokenMetadataProce
                         continue;
                     }
                     let contractAddresses = null;
+                    let smartContractAddress = null;
                     if (details.contract_addresses) {
                         const filtered = {};
                         for (const [network, address] of Object.entries(details.contract_addresses)) {
@@ -84,6 +97,43 @@ let TokenMetadataProcessor = TokenMetadataProcessor_1 = class TokenMetadataProce
                         }
                         contractAddresses = Object.keys(filtered).length > 0 ? filtered : null;
                     }
+                    if (contractAddresses) {
+                        if (contractAddresses.ethereum) {
+                            smartContractAddress = contractAddresses.ethereum;
+                        }
+                        else if (contractAddresses['ethereum-classic']) {
+                            smartContractAddress = contractAddresses['ethereum-classic'];
+                        }
+                        else if (contractAddresses.binance) {
+                            smartContractAddress = contractAddresses.binance;
+                        }
+                        else if (contractAddresses.polygon) {
+                            smartContractAddress = contractAddresses.polygon;
+                        }
+                        else if (contractAddresses.avalanche) {
+                            smartContractAddress = contractAddresses.avalanche;
+                        }
+                        else {
+                            const firstPlatform = Object.keys(contractAddresses)[0];
+                            if (firstPlatform) {
+                                smartContractAddress = contractAddresses[firstPlatform];
+                            }
+                        }
+                    }
+                    else if (details.platforms && typeof details.platforms === 'object') {
+                        if (details.platforms.ethereum) {
+                            smartContractAddress = details.platforms.ethereum;
+                        }
+                        else {
+                            const platforms = Object.entries(details.platforms);
+                            for (const [network, address] of platforms) {
+                                if (address && typeof address === 'string' && address.trim() !== '') {
+                                    smartContractAddress = address;
+                                    break;
+                                }
+                            }
+                        }
+                    }
                     const categories = details.categories && Array.isArray(details.categories) && details.categories.length > 0
                         ? details.categories
                         : null;
@@ -99,7 +149,7 @@ let TokenMetadataProcessor = TokenMetadataProcessor_1 = class TokenMetadataProce
                         },
                         about: details.description?.en || null,
                         category: details.categories && details.categories.length ? details.categories.join(',') : null,
-                        smart_contract_address: (details.platforms && details.platforms.ethereum) ? details.platforms.ethereum : null,
+                        smart_contract_address: smartContractAddress,
                         contract_address: contractAddresses,
                         categories: categories
                     };

@@ -302,15 +302,29 @@ let PricesService = PricesService_1 = class PricesService {
                 }
                 if (!found) {
                     for (let page = 1; page <= searchPages; page++) {
-                        const markets = await this.cg.coinsMarkets(page);
-                        found = markets.find((m) => m.symbol && m.symbol.toLowerCase() === symbol.toLowerCase());
-                        if (found) {
-                            liveData = found;
-                            coinId = found.id;
-                            break;
+                        try {
+                            const markets = await this.cg.coinsMarkets(page);
+                            found = markets.find((m) => m.symbol && m.symbol.toLowerCase() === symbol.toLowerCase());
+                            if (found) {
+                                liveData = found;
+                                coinId = found.id;
+                                break;
+                            }
+                            if (!markets || markets.length === 0)
+                                break;
                         }
-                        if (!markets || markets.length === 0)
-                            break;
+                        catch (err) {
+                            if (err?.response?.status === 429) {
+                                const retryAfter = err?.response?.headers?.['retry-after'];
+                                const waitTime = retryAfter ? Number(retryAfter) * 1000 : 60000;
+                                this.logger.warn(`Rate limit hit while searching markets (page ${page}). CoinGecko API limit reached. Please try again later.`);
+                                break;
+                            }
+                            this.logger.warn(`Failed to fetch markets page ${page}: ${err?.message || err}`);
+                            if (err?.response?.status >= 500) {
+                                break;
+                            }
+                        }
                     }
                 }
                 if (!found) {
@@ -353,16 +367,29 @@ let PricesService = PricesService_1 = class PricesService {
                                 }
                             }
                             if (!coinDetailsData) {
-                                coinDetailsData = await this.cg.coinDetails(coinId, !found);
                                 try {
-                                    const client = this.ensureRedis();
-                                    if (client) {
-                                        const detailsKey = this.coinDetailsKey(coinId);
-                                        await client.set(detailsKey, JSON.stringify(coinDetailsData), 'EX', 3600);
+                                    coinDetailsData = await this.cg.coinDetails(coinId, !found);
+                                    try {
+                                        const client = this.ensureRedis();
+                                        if (client) {
+                                            const detailsKey = this.coinDetailsKey(coinId);
+                                            await client.set(detailsKey, JSON.stringify(coinDetailsData), 'EX', 3600);
+                                        }
+                                    }
+                                    catch (err) {
+                                        this.logger.debug('Failed to cache coin details');
                                     }
                                 }
                                 catch (err) {
-                                    this.logger.debug('Failed to cache coin details');
+                                    if (err?.response?.status === 429) {
+                                        const retryAfter = err?.response?.headers?.['retry-after'];
+                                        this.logger.warn(`Rate limit hit while fetching coin details for ${coinId}. CoinGecko API limit reached. Please try again later.`);
+                                        coinDetailsData = null;
+                                    }
+                                    else {
+                                        this.logger.warn(`Failed to fetch coin details for ${coinId}: ${err?.message || err}`);
+                                        coinDetailsData = null;
+                                    }
                                 }
                             }
                         }
@@ -414,6 +441,11 @@ let PricesService = PricesService_1 = class PricesService {
                 }
             }
             catch (err) {
+                if (err?.response?.status === 429) {
+                    const retryAfter = err?.response?.headers?.['retry-after'];
+                    this.logger.warn(`Rate limit hit in fallback fetch. CoinGecko API limit reached. Retry-After: ${retryAfter || 'unknown'} seconds`);
+                    return null;
+                }
                 this.logger.error('fallback fetch failed', err);
                 throw err;
             }

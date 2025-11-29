@@ -1,8 +1,8 @@
 -- Create tokens table for static token metadata
 CREATE TABLE IF NOT EXISTS tokens (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    symbol VARCHAR(50) NOT NULL,
-    coingecko_id VARCHAR(200) NOT NULL UNIQUE,
+    symbol VARCHAR(50) NOT NULL UNIQUE,
+    coingecko_id VARCHAR(200),
     name VARCHAR(200),
     logo TEXT,
     image_url TEXT,
@@ -19,7 +19,7 @@ CREATE TABLE IF NOT EXISTS tokens (
 
 -- Create indexes
 CREATE INDEX IF NOT EXISTS idx_tokens_symbol ON tokens(symbol);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_tokens_coingecko_id ON tokens(coingecko_id);
+CREATE INDEX IF NOT EXISTS idx_tokens_coingecko_id ON tokens(coingecko_id);
 
 -- Add comment
 COMMENT ON TABLE tokens IS 'Static token metadata (logo, social links, categories, contract_address). Live price data is NOT stored here.';

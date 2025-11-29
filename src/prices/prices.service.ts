@@ -1,6 +1,6 @@
 import { Injectable, Logger, OnModuleInit, OnModuleDestroy } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+import { Repository, Not, IsNull } from 'typeorm';
 import { RedisService } from '../common/redis.service';
 import { CoingeckoService } from './coingecko.service';
 import { Token } from '../entities/token.entity';
@@ -658,21 +658,64 @@ export class PricesService implements OnModuleInit, OnModuleDestroy {
 
   /**
    * Starts the background polling mechanism
-   * Periodically fetches price data from CoinGecko for only the three main tokens: bitcoin, ethereum, solana
+   * Periodically fetches price data from CoinGecko for all tokens in the database
    * Runs immediately on startup, then at configured intervals
-   * Handles rate limiting and caches only the tokens we care about
+   * Handles rate limiting and caches prices for all tokens
    */
   private startPoller() {
-    // Only poll for the three main tokens: bitcoin, ethereum, solana
-    const targetIds = ['bitcoin', 'ethereum', 'solana'];
-    
     // run immediately once, then schedule
     const runOnce = async () => {
-      this.logger.debug('poller tick - fetching prices for bitcoin, ethereum, solana');
-      
       try {
-        // Fetch market data only for our target tokens
-        const markets = await this.cg.coinsMarkets(1, targetIds);
+        // Fetch all coin IDs from database
+        const tokens = await this.tokenRepo.find({ 
+          select: ['coingecko_id'],
+          where: { coingecko_id: Not(IsNull()) }
+        });
+        
+        const coinIds = tokens
+          .map(t => t.coingecko_id)
+          .filter(id => id && id.trim() !== '');
+        
+        if (coinIds.length === 0) {
+          this.logger.warn('No tokens found in database to poll prices for');
+          return;
+        }
+        
+        this.logger.debug(`poller tick - fetching prices for ${coinIds.length} tokens`);
+        
+        // Fetch market data for all tokens (CoinGecko supports up to 250 IDs per request)
+        // Split into batches of 250 to avoid URL length limits
+        const batchSize = 250;
+        const allMarkets: any[] = [];
+        
+        for (let i = 0; i < coinIds.length; i += batchSize) {
+          const batch = coinIds.slice(i, i + batchSize);
+          try {
+            const markets = await this.cg.coinsMarkets(1, batch);
+            if (markets && Array.isArray(markets)) {
+              allMarkets.push(...markets);
+            }
+            
+            // Small delay between batches to avoid rate limits
+            if (i + batchSize < coinIds.length) {
+              await new Promise(resolve => setTimeout(resolve, 200));
+            }
+          } catch (err: any) {
+            // Handle rate limits gracefully
+            if (err?.response?.status === 429) {
+              const retryAfter = err?.response?.headers?.['retry-after'];
+              const waitTime = retryAfter ? Number(retryAfter) * 1000 : 60000;
+              this.logger.warn(`Rate limit hit while fetching batch ${Math.floor(i / batchSize) + 1}. Waiting ${waitTime}ms`);
+              await new Promise(resolve => setTimeout(resolve, waitTime));
+              // Retry this batch
+              i -= batchSize;
+              continue;
+            }
+            this.logger.warn(`Failed to fetch batch ${Math.floor(i / batchSize) + 1}: ${err?.message || err}`);
+          }
+        }
+        
+        const markets = allMarkets;
         
         if (!markets || markets.length === 0) {
           this.logger.warn('No market data returned for target tokens');

@@ -527,11 +527,46 @@ let PricesService = PricesService_1 = class PricesService {
         }
     }
     startPoller() {
-        const targetIds = ['bitcoin', 'ethereum', 'solana'];
         const runOnce = async () => {
-            this.logger.debug('poller tick - fetching prices for bitcoin, ethereum, solana');
             try {
-                const markets = await this.cg.coinsMarkets(1, targetIds);
+                const tokens = await this.tokenRepo.find({
+                    select: ['coingecko_id'],
+                    where: { coingecko_id: (0, typeorm_2.Not)((0, typeorm_2.IsNull)()) }
+                });
+                const coinIds = tokens
+                    .map(t => t.coingecko_id)
+                    .filter(id => id && id.trim() !== '');
+                if (coinIds.length === 0) {
+                    this.logger.warn('No tokens found in database to poll prices for');
+                    return;
+                }
+                this.logger.debug(`poller tick - fetching prices for ${coinIds.length} tokens`);
+                const batchSize = 250;
+                const allMarkets = [];
+                for (let i = 0; i < coinIds.length; i += batchSize) {
+                    const batch = coinIds.slice(i, i + batchSize);
+                    try {
+                        const markets = await this.cg.coinsMarkets(1, batch);
+                        if (markets && Array.isArray(markets)) {
+                            allMarkets.push(...markets);
+                        }
+                        if (i + batchSize < coinIds.length) {
+                            await new Promise(resolve => setTimeout(resolve, 200));
+                        }
+                    }
+                    catch (err) {
+                        if (err?.response?.status === 429) {
+                            const retryAfter = err?.response?.headers?.['retry-after'];
+                            const waitTime = retryAfter ? Number(retryAfter) * 1000 : 60000;
+                            this.logger.warn(`Rate limit hit while fetching batch ${Math.floor(i / batchSize) + 1}. Waiting ${waitTime}ms`);
+                            await new Promise(resolve => setTimeout(resolve, waitTime));
+                            i -= batchSize;
+                            continue;
+                        }
+                        this.logger.warn(`Failed to fetch batch ${Math.floor(i / batchSize) + 1}: ${err?.message || err}`);
+                    }
+                }
+                const markets = allMarkets;
                 if (!markets || markets.length === 0) {
                     this.logger.warn('No market data returned for target tokens');
                     return;

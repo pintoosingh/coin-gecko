@@ -154,32 +154,38 @@ async function main() {
             contractAddresses = Object.keys(filtered).length > 0 ? filtered : null;
             
             // Extract smart_contract_address: prioritize common networks, then any available
-            if (contractAddresses.ethereum) {
-              smartContractAddress = contractAddresses.ethereum;
-            } else if (contractAddresses['ethereum-classic']) {
-              smartContractAddress = contractAddresses['ethereum-classic'];
-            } else if (contractAddresses.binance || contractAddresses['binance-smart-chain']) {
-              smartContractAddress = contractAddresses.binance || contractAddresses['binance-smart-chain'];
-            } else if (contractAddresses.polygon || contractAddresses['polygon-pos']) {
-              smartContractAddress = contractAddresses.polygon || contractAddresses['polygon-pos'];
-            } else if (contractAddresses.avalanche) {
-              smartContractAddress = contractAddresses.avalanche;
-            } else if (contractAddresses.core || contractAddresses['core-dao']) {
-              smartContractAddress = contractAddresses.core || contractAddresses['core-dao'];
-            } else {
-              // Fallback: use first available platform (any network)
-              const firstPlatform = Object.keys(contractAddresses)[0];
-              if (firstPlatform) {
-                smartContractAddress = contractAddresses[firstPlatform];
+            // Only check if contractAddresses is not null
+            if (contractAddresses) {
+              if (contractAddresses.ethereum) {
+                smartContractAddress = contractAddresses.ethereum;
+              } else if (contractAddresses['ethereum-classic']) {
+                smartContractAddress = contractAddresses['ethereum-classic'];
+              } else if (contractAddresses.binance || contractAddresses['binance-smart-chain']) {
+                smartContractAddress = contractAddresses.binance || contractAddresses['binance-smart-chain'];
+              } else if (contractAddresses.polygon || contractAddresses['polygon-pos']) {
+                smartContractAddress = contractAddresses.polygon || contractAddresses['polygon-pos'];
+              } else if (contractAddresses.avalanche) {
+                smartContractAddress = contractAddresses.avalanche;
+              } else if (contractAddresses.core || contractAddresses['core-dao']) {
+                smartContractAddress = contractAddresses.core || contractAddresses['core-dao'];
+              } else {
+                // Fallback: use first available platform (any network)
+                const firstPlatform = Object.keys(contractAddresses)[0];
+                if (firstPlatform) {
+                  smartContractAddress = contractAddresses[firstPlatform];
+                }
               }
             }
           }
           
-          // If no contract address found in /coins/list, try fetching coinDetails for important tokens
-          // This handles cases where /coins/list doesn't include platform data
-          if (!smartContractAddress && !contractAddresses) {
-            // For tokens that should have contract addresses (like CORE), fetch details
-            // But only for a small subset to avoid rate limits - use coinDetails for missing data
+          // Skip coinDetails fallback to avoid rate limits
+          // Most tokens should have platforms in /coins/list response
+          // Missing contract addresses can be updated later via token metadata processor
+          // If you need to fetch coinDetails, set FETCH_MISSING_CONTRACT_ADDRESSES=true in .env
+          const fetchMissingAddresses = process.env.FETCH_MISSING_CONTRACT_ADDRESSES === 'true';
+          
+          if (fetchMissingAddresses && !smartContractAddress && !contractAddresses) {
+            // Only fetch coinDetails if explicitly enabled (to avoid rate limits)
             try {
               const details = await cg.coinDetails(coinId);
               
@@ -214,14 +220,18 @@ async function main() {
                       smartContractAddress = filtered[firstPlatform];
                     }
                   }
-                  
                 }
               }
               
-              // Small delay to avoid rate limits when fetching coinDetails
-              await new Promise((res) => setTimeout(res, 100));
-            } catch (err) {
-              // Silently continue if coinDetails fails - we'll use what we have from /coins/list
+              // Delay to avoid rate limits when fetching coinDetails
+              await new Promise((res) => setTimeout(res, 2000)); // 2 seconds delay
+            } catch (err: any) {
+              // If rate limited, stop fetching coinDetails to avoid blocking the entire seed
+              if (err?.response?.status === 429) {
+                console.warn(`Rate limit hit while fetching coinDetails. Skipping remaining coinDetails calls.`);
+                // Disable further coinDetails calls for this run
+                process.env.FETCH_MISSING_CONTRACT_ADDRESSES = 'false';
+              }
             }
           }
           
@@ -252,13 +262,37 @@ async function main() {
           if ((i + 1) % 1000 === 0 || i + 1 === coinsToProcess.length) {
             console.log(`Progress: ${i + 1}/${coinsToProcess.length} processed (${seeded} seeded, ${failed} failed)`);
           }
-        } catch (err) {
-          console.error(`Failed to seed ${coin.id}:`, (err as any).message);
+        } catch (err: any) {
+          // Log detailed error information
+          const errorMsg = err?.message || String(err);
+          const errorCode = err?.code;
+          const errorDetail = err?.detail;
+          
+          console.error(`Failed to seed ${coin.id} (${coin.symbol}): ${errorMsg}`);
+          if (errorCode) {
+            console.error(`  Error code: ${errorCode}`);
+          }
+          if (errorDetail) {
+            console.error(`  Error detail: ${errorDetail}`);
+          }
+          
+          // If it's a constraint violation, log the conflicting data
+          if (errorCode === '23505' || errorMsg.includes('duplicate') || errorMsg.includes('unique')) {
+            console.error(`  ⚠️ Duplicate key violation for coingecko_id: ${coin.id}`);
+          }
+          
           failed++;
         }
       }
       
       console.log(`\nSeed completed: ${seeded} tokens seeded, ${failed} failed`);
+      console.log(`Total processed: ${coinsToProcess.length} coins`);
+      console.log(`Success rate: ${((seeded / coinsToProcess.length) * 100).toFixed(2)}%`);
+      
+      if (failed > 0) {
+        console.log(`\n⚠️ Warning: ${failed} coins failed to seed. Check error messages above for details.`);
+      }
+      
       console.log(`\nNote: Basic token data (symbol, name, contract addresses) has been stored.`);
       console.log(`To get additional metadata (logo, description, etc.), run the token metadata processor or update individual tokens.`);
       
@@ -417,7 +451,7 @@ async function main() {
               smartContractAddress = contractAddresses[firstPlatform];
             }
           }
-        }
+      }
       
       // Process categories: store as JSON array
       const categories = details.categories && Array.isArray(details.categories) && details.categories.length > 0

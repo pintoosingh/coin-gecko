@@ -97,32 +97,35 @@ async function main() {
                             }
                         }
                         contractAddresses = Object.keys(filtered).length > 0 ? filtered : null;
-                        if (contractAddresses.ethereum) {
-                            smartContractAddress = contractAddresses.ethereum;
-                        }
-                        else if (contractAddresses['ethereum-classic']) {
-                            smartContractAddress = contractAddresses['ethereum-classic'];
-                        }
-                        else if (contractAddresses.binance || contractAddresses['binance-smart-chain']) {
-                            smartContractAddress = contractAddresses.binance || contractAddresses['binance-smart-chain'];
-                        }
-                        else if (contractAddresses.polygon || contractAddresses['polygon-pos']) {
-                            smartContractAddress = contractAddresses.polygon || contractAddresses['polygon-pos'];
-                        }
-                        else if (contractAddresses.avalanche) {
-                            smartContractAddress = contractAddresses.avalanche;
-                        }
-                        else if (contractAddresses.core || contractAddresses['core-dao']) {
-                            smartContractAddress = contractAddresses.core || contractAddresses['core-dao'];
-                        }
-                        else {
-                            const firstPlatform = Object.keys(contractAddresses)[0];
-                            if (firstPlatform) {
-                                smartContractAddress = contractAddresses[firstPlatform];
+                        if (contractAddresses) {
+                            if (contractAddresses.ethereum) {
+                                smartContractAddress = contractAddresses.ethereum;
+                            }
+                            else if (contractAddresses['ethereum-classic']) {
+                                smartContractAddress = contractAddresses['ethereum-classic'];
+                            }
+                            else if (contractAddresses.binance || contractAddresses['binance-smart-chain']) {
+                                smartContractAddress = contractAddresses.binance || contractAddresses['binance-smart-chain'];
+                            }
+                            else if (contractAddresses.polygon || contractAddresses['polygon-pos']) {
+                                smartContractAddress = contractAddresses.polygon || contractAddresses['polygon-pos'];
+                            }
+                            else if (contractAddresses.avalanche) {
+                                smartContractAddress = contractAddresses.avalanche;
+                            }
+                            else if (contractAddresses.core || contractAddresses['core-dao']) {
+                                smartContractAddress = contractAddresses.core || contractAddresses['core-dao'];
+                            }
+                            else {
+                                const firstPlatform = Object.keys(contractAddresses)[0];
+                                if (firstPlatform) {
+                                    smartContractAddress = contractAddresses[firstPlatform];
+                                }
                             }
                         }
                     }
-                    if (!smartContractAddress && !contractAddresses) {
+                    const fetchMissingAddresses = process.env.FETCH_MISSING_CONTRACT_ADDRESSES === 'true';
+                    if (fetchMissingAddresses && !smartContractAddress && !contractAddresses) {
                         try {
                             const details = await cg.coinDetails(coinId);
                             if (details.platforms && typeof details.platforms === 'object') {
@@ -161,9 +164,13 @@ async function main() {
                                     }
                                 }
                             }
-                            await new Promise((res) => setTimeout(res, 100));
+                            await new Promise((res) => setTimeout(res, 2000));
                         }
                         catch (err) {
+                            if (err?.response?.status === 429) {
+                                console.warn(`Rate limit hit while fetching coinDetails. Skipping remaining coinDetails calls.`);
+                                process.env.FETCH_MISSING_CONTRACT_ADDRESSES = 'false';
+                            }
                         }
                     }
                     const meta = {
@@ -189,11 +196,28 @@ async function main() {
                     }
                 }
                 catch (err) {
-                    console.error(`Failed to seed ${coin.id}:`, err.message);
+                    const errorMsg = err?.message || String(err);
+                    const errorCode = err?.code;
+                    const errorDetail = err?.detail;
+                    console.error(`Failed to seed ${coin.id} (${coin.symbol}): ${errorMsg}`);
+                    if (errorCode) {
+                        console.error(`  Error code: ${errorCode}`);
+                    }
+                    if (errorDetail) {
+                        console.error(`  Error detail: ${errorDetail}`);
+                    }
+                    if (errorCode === '23505' || errorMsg.includes('duplicate') || errorMsg.includes('unique')) {
+                        console.error(`  ⚠️ Duplicate key violation for coingecko_id: ${coin.id}`);
+                    }
                     failed++;
                 }
             }
             console.log(`\nSeed completed: ${seeded} tokens seeded, ${failed} failed`);
+            console.log(`Total processed: ${coinsToProcess.length} coins`);
+            console.log(`Success rate: ${((seeded / coinsToProcess.length) * 100).toFixed(2)}%`);
+            if (failed > 0) {
+                console.log(`\n⚠️ Warning: ${failed} coins failed to seed. Check error messages above for details.`);
+            }
             console.log(`\nNote: Basic token data (symbol, name, contract addresses) has been stored.`);
             console.log(`To get additional metadata (logo, description, etc.), run the token metadata processor or update individual tokens.`);
             await ds.destroy();

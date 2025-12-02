@@ -658,46 +658,58 @@ export class PricesService implements OnModuleInit, OnModuleDestroy {
 
   /**
    * Starts the background polling mechanism
-   * Periodically fetches price data from CoinGecko for all tokens in the database
+   * Periodically fetches price data from CoinGecko for tokens in the database
+   * Processes in smaller batches to avoid memory issues and rate limits
    * Runs immediately on startup, then at configured intervals
-   * Handles rate limiting and caches prices for all tokens
    */
   private startPoller() {
     // run immediately once, then schedule
     const runOnce = async () => {
       try {
-        // Fetch all coin IDs from database
-        const tokens = await this.tokenRepo.find({ 
-          select: ['coingecko_id'],
-          where: { coingecko_id: Not(IsNull()) }
-        });
+        // Limit the number of tokens to poll per cycle to avoid memory issues
+        // Poll top tokens by market cap (first page of markets) instead of all tokens
+        const maxTokensToPoll = Number(process.env.MAX_TOKENS_TO_POLL || 1000); // Default: 1000 tokens
         
-        const coinIds = tokens
-          .map(t => t.coingecko_id)
-          .filter(id => id && id.trim() !== '');
+        this.logger.debug(`poller tick - fetching prices for top ${maxTokensToPoll} tokens`);
         
-        if (coinIds.length === 0) {
-          this.logger.warn('No tokens found in database to poll prices for');
-          return;
-        }
+        // Fetch market data for top tokens (sorted by market cap)
+        // This avoids loading all 19k+ tokens into memory
+        const batchSize = 250; // CoinGecko limit per request
+        const batchesNeeded = Math.ceil(maxTokensToPoll / batchSize);
+        const client = this.ensureRedis();
+        let totalCached = 0;
         
-        this.logger.debug(`poller tick - fetching prices for ${coinIds.length} tokens`);
-        
-        // Fetch market data for all tokens (CoinGecko supports up to 250 IDs per request)
-        // Split into batches of 250 to avoid URL length limits
-        const batchSize = 250;
-        const allMarkets: any[] = [];
-        
-        for (let i = 0; i < coinIds.length; i += batchSize) {
-          const batch = coinIds.slice(i, i + batchSize);
+        for (let page = 1; page <= batchesNeeded; page++) {
           try {
-            const markets = await this.cg.coinsMarkets(1, batch);
-            if (markets && Array.isArray(markets)) {
-              allMarkets.push(...markets);
+            // Fetch markets page (sorted by market cap desc)
+            const markets = await this.cg.coinsMarkets(page);
+            if (!markets || markets.length === 0) {
+              break;
+            }
+            
+            // Cache immediately instead of storing in memory
+            if (client) {
+              try {
+                const pipeline = client.pipeline();
+                for (const m of markets) {
+                  if (m.symbol) {
+                    pipeline.set(this.priceKey(m.symbol), JSON.stringify(m), 'EX', this.ttl);
+                  }
+                }
+                await pipeline.exec();
+                totalCached += markets.length;
+              } catch (err) {
+                this.logger.warn(`Failed to write batch ${page} to Redis: ${(err as any).message}`);
+              }
+            }
+            
+            // Stop if we've cached enough tokens
+            if (totalCached >= maxTokensToPoll) {
+              break;
             }
             
             // Small delay between batches to avoid rate limits
-            if (i + batchSize < coinIds.length) {
+            if (page < batchesNeeded) {
               await new Promise(resolve => setTimeout(resolve, 200));
             }
           } catch (err: any) {
@@ -705,40 +717,21 @@ export class PricesService implements OnModuleInit, OnModuleDestroy {
             if (err?.response?.status === 429) {
               const retryAfter = err?.response?.headers?.['retry-after'];
               const waitTime = retryAfter ? Number(retryAfter) * 1000 : 60000;
-              this.logger.warn(`Rate limit hit while fetching batch ${Math.floor(i / batchSize) + 1}. Waiting ${waitTime}ms`);
+              this.logger.warn(`Rate limit hit while fetching batch ${page}. Waiting ${waitTime}ms`);
               await new Promise(resolve => setTimeout(resolve, waitTime));
               // Retry this batch
-              i -= batchSize;
+              page--;
               continue;
             }
-            this.logger.warn(`Failed to fetch batch ${Math.floor(i / batchSize) + 1}: ${err?.message || err}`);
+            this.logger.warn(`Failed to fetch batch ${page}: ${err?.message || err}`);
+            break; // Stop on other errors
           }
         }
         
-        const markets = allMarkets;
-        
-        if (!markets || markets.length === 0) {
-          this.logger.warn('No market data returned for target tokens');
-          return;
-        }
-
-        const client = this.ensureRedis();
-        if (client) {
-          try {
-            const pipeline = client.pipeline();
-            // Cache each token individually
-            for (const m of markets) {
-              if (m.symbol) {
-                pipeline.set(this.priceKey(m.symbol), JSON.stringify(m), 'EX', this.ttl);
-              }
-            }
-            await pipeline.exec();
-            this.logger.debug(`Cached ${markets.length} tokens in Redis`);
-          } catch (err) {
-            this.logger.warn('Failed to write markets to Redis pipeline: ' + (err as any).message);
-          }
+        if (totalCached > 0) {
+          this.logger.debug(`Cached ${totalCached} token prices in Redis`);
         } else {
-          this.logger.debug('Redis not available while polling; skipping caching');
+          this.logger.warn('No market data cached');
         }
 
         // Live price data is cached in Redis for fast access (NOT saved to database)

@@ -529,28 +529,37 @@ let PricesService = PricesService_1 = class PricesService {
     startPoller() {
         const runOnce = async () => {
             try {
-                const tokens = await this.tokenRepo.find({
-                    select: ['coingecko_id'],
-                    where: { coingecko_id: (0, typeorm_2.Not)((0, typeorm_2.IsNull)()) }
-                });
-                const coinIds = tokens
-                    .map(t => t.coingecko_id)
-                    .filter(id => id && id.trim() !== '');
-                if (coinIds.length === 0) {
-                    this.logger.warn('No tokens found in database to poll prices for');
-                    return;
-                }
-                this.logger.debug(`poller tick - fetching prices for ${coinIds.length} tokens`);
+                const maxTokensToPoll = Number(process.env.MAX_TOKENS_TO_POLL || 1000);
+                this.logger.debug(`poller tick - fetching prices for top ${maxTokensToPoll} tokens`);
                 const batchSize = 250;
-                const allMarkets = [];
-                for (let i = 0; i < coinIds.length; i += batchSize) {
-                    const batch = coinIds.slice(i, i + batchSize);
+                const batchesNeeded = Math.ceil(maxTokensToPoll / batchSize);
+                const client = this.ensureRedis();
+                let totalCached = 0;
+                for (let page = 1; page <= batchesNeeded; page++) {
                     try {
-                        const markets = await this.cg.coinsMarkets(1, batch);
-                        if (markets && Array.isArray(markets)) {
-                            allMarkets.push(...markets);
+                        const markets = await this.cg.coinsMarkets(page);
+                        if (!markets || markets.length === 0) {
+                            break;
                         }
-                        if (i + batchSize < coinIds.length) {
+                        if (client) {
+                            try {
+                                const pipeline = client.pipeline();
+                                for (const m of markets) {
+                                    if (m.symbol) {
+                                        pipeline.set(this.priceKey(m.symbol), JSON.stringify(m), 'EX', this.ttl);
+                                    }
+                                }
+                                await pipeline.exec();
+                                totalCached += markets.length;
+                            }
+                            catch (err) {
+                                this.logger.warn(`Failed to write batch ${page} to Redis: ${err.message}`);
+                            }
+                        }
+                        if (totalCached >= maxTokensToPoll) {
+                            break;
+                        }
+                        if (page < batchesNeeded) {
                             await new Promise(resolve => setTimeout(resolve, 200));
                         }
                     }
@@ -558,37 +567,20 @@ let PricesService = PricesService_1 = class PricesService {
                         if (err?.response?.status === 429) {
                             const retryAfter = err?.response?.headers?.['retry-after'];
                             const waitTime = retryAfter ? Number(retryAfter) * 1000 : 60000;
-                            this.logger.warn(`Rate limit hit while fetching batch ${Math.floor(i / batchSize) + 1}. Waiting ${waitTime}ms`);
+                            this.logger.warn(`Rate limit hit while fetching batch ${page}. Waiting ${waitTime}ms`);
                             await new Promise(resolve => setTimeout(resolve, waitTime));
-                            i -= batchSize;
+                            page--;
                             continue;
                         }
-                        this.logger.warn(`Failed to fetch batch ${Math.floor(i / batchSize) + 1}: ${err?.message || err}`);
+                        this.logger.warn(`Failed to fetch batch ${page}: ${err?.message || err}`);
+                        break;
                     }
                 }
-                const markets = allMarkets;
-                if (!markets || markets.length === 0) {
-                    this.logger.warn('No market data returned for target tokens');
-                    return;
-                }
-                const client = this.ensureRedis();
-                if (client) {
-                    try {
-                        const pipeline = client.pipeline();
-                        for (const m of markets) {
-                            if (m.symbol) {
-                                pipeline.set(this.priceKey(m.symbol), JSON.stringify(m), 'EX', this.ttl);
-                            }
-                        }
-                        await pipeline.exec();
-                        this.logger.debug(`Cached ${markets.length} tokens in Redis`);
-                    }
-                    catch (err) {
-                        this.logger.warn('Failed to write markets to Redis pipeline: ' + err.message);
-                    }
+                if (totalCached > 0) {
+                    this.logger.debug(`Cached ${totalCached} token prices in Redis`);
                 }
                 else {
-                    this.logger.debug('Redis not available while polling; skipping caching');
+                    this.logger.warn('No market data cached');
                 }
             }
             catch (err) {
